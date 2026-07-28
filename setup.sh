@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  setup.sh - All-in-one installer & manager for the Enhanced Telegram
+#  setup.sh - All-in-one installer & manager for the Aurora Telegram
 #             Downloader Bot (SoundCloud / Spotify / YouTube / Pinterest /
 #             Instagram / TikTok / Twitter)
 #
@@ -39,9 +39,9 @@ ENV_FILE="${PROJECT_DIR}/.env"
 CONFIG_FILE="${PROJECT_DIR}/.setup-config"
 LOG_DIR="${PROJECT_DIR}/logs"
 BACKUP_DIR="${PROJECT_DIR}/backups"
-BOT_SCRIPT="${BOT_SCRIPT:-enhanced_bot.py}"
+BOT_SCRIPT="${BOT_SCRIPT:-aurora_bot.py}"
 BOT_SCRIPT_ABS="${PROJECT_DIR}/${BOT_SCRIPT}"
-DB_PATH="${PROJECT_DIR}/sc_bot.db"
+DB_PATH="${PROJECT_DIR}/aurora.db"
 COOKIES_PATH="${PROJECT_DIR}/cookies.txt"
 
 # Service defaults (overridden by config / prompts)
@@ -124,7 +124,7 @@ patch_bot_value() {
 do_install() {
     echo -e "${CYAN}${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║   Enhanced Telegram Downloader Bot - Full Installation      ║"
+    echo "║   Aurora Telegram Downloader Bot (aiogram 3.x) - Install   ║"
     echo "║   SoundCloud | Spotify | YouTube | Pinterest | Instagram    ║"
     echo "║   TikTok | Twitter (X)                                       ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
@@ -174,7 +174,7 @@ do_install() {
 
     read -rp "  Forced channel username (with @, leave blank to skip): " CHANNEL_USERNAME
     read -rp "  Companion channel (with @, leave blank to skip): " COMPANION_ID_INPUT
-    read -rp "  Flask keep-alive port [${BOT_PORT}]: " PORT_INPUT
+    read -rp "  aiohttp keep-alive port [${BOT_PORT}]: " PORT_INPUT
     BOT_PORT="${PORT_INPUT:-$BOT_PORT}"
 
     # Cookies (optional but helps YouTube)
@@ -202,7 +202,7 @@ do_install() {
 
     # --- 5. Write .env (for reference + systemd EnvironmentFile) ---
     cat > "$ENV_FILE" <<EOF
-# Reference environment file - the bot reads its config from enhanced_bot.py
+# Reference environment file - the bot reads its config from aurora_bot.py
 # This file is used by the systemd service for any extra env vars.
 BOT_PORT=${BOT_PORT}
 EOF
@@ -223,7 +223,7 @@ EOF
         "$PIP" install -r "${PROJECT_DIR}/requirements.txt"
     else
         warn "requirements.txt not found - installing core deps manually..."
-        "$PIP" install -q pyTelegramBotAPI yt-dlp Flask requests mutagen spotapi
+        "$PIP" install -q aiogram yt-dlp aiohttp requests Pillow mutagen spotapi
     fi
     ok "Python dependencies installed"
 
@@ -290,7 +290,7 @@ except Exception as e:
         info "Writing service file to ${SERVICE_FILE}..."
         cat > "/tmp/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Enhanced Telegram Downloader Bot (${SERVICE_NAME})
+Description=Aurora Telegram Downloader Bot (${SERVICE_NAME})
 After=network-online.target
 Wants=network-online.target
 
@@ -304,7 +304,7 @@ Restart=${RESTART}
 RestartSec=10
 StandardOutput=append:${LOG_DIR}/bot.log
 StandardError=append:${LOG_DIR}/bot_error.log
-# Give the bot a generous timeout to start (it boots Flask + Telegram polling)
+# Give the bot a generous timeout to start (it boots aiohttp + Telegram polling)
 TimeoutStartSec=60
 # Resource limits - prevent runaway memory
 MemoryMax=1G
@@ -689,7 +689,7 @@ do_full_uninstall() {
 # ----------------------------------------------------------------------------
 do_help() {
     cat <<EOF
-${BOLD}Enhanced Telegram Downloader Bot - setup.sh${NC}
+${BOLD}Aurora Telegram Downloader Bot - setup.sh${NC}
 
 ${BOLD}Usage:${NC}
   ./setup.sh [OPTION]
@@ -704,7 +704,7 @@ ${BOLD}Options:${NC}
   ${GREEN}--reconfigure${NC}    Edit bot token / channel / port
   ${GREEN}--backup${NC}         Backup database + config to ./backups/
   ${GREEN}--restore${NC}        Restore from a previous backup
-  ${GREEN}--health${NC}         Check the Flask /health endpoint
+  ${GREEN}--health${NC}         Check the aiohttp /health endpoint
   ${GREEN}--remove${NC}         Remove only the systemd service
   ${GREEN}--uninstall${NC}      Full uninstall (service + venv + logs + db)
   ${GREEN}-h, --help${NC}       Show this help message
@@ -724,7 +724,7 @@ show_menu() {
     clear
     echo -e "${BOLD}${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║       Enhanced Telegram Downloader Bot - Manager            ║"
+    echo "║       Aurora Telegram Downloader Bot - Manager            ║"
     echo "║       SoundCloud | Spotify | YouTube | Pinterest |          ║"
     echo "║       Instagram | TikTok | Twitter (X)                       ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
