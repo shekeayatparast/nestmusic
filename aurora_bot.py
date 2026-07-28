@@ -1,76 +1,115 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 # ============================================================
-#  Enhanced Telegram Downloader Bot  v4.1
-#  Platforms: SoundCloud | Spotify | YouTube | Pinterest |
-#             Instagram | TikTok | Twitter (X)
+#  Aurora Downloader Bot  v5.0  (aiogram 3.x — async)
+#  ------------------------------------------------------------
+#  Platforms:
+#    • SoundCloud  (tracks / playlists / albums / search)
+#    • Spotify     (tracks / albums / playlists — via spotapi, NO API keys)
+#    • YouTube     (videos / Shorts / quality picker)
+#    • Pinterest   (videos / images / story pins)
+#    • Instagram   (reels / posts / stories)
+#    • TikTok      (videos)
+#    • Twitter / X (videos / gifs)
 #
 #  Features:
-#   - Multi-platform download with best quality
-#   - Colorful, polished inline keyboards
-#   - Spotify: single tracks, albums & full playlists
-#       (uses spotapi - NO API keys, NO login required!)
-#       "Download All" button downloads every track in an album/playlist
-#   - Live progress bars, detailed statistics
-#   - Smart proxy rotation for geo-restricted content
-#   - Bilingual UI (Persian / English)
+#    • 100% async (aiogram 3.x + aiohttp keepalive)
+#    • Real coloured buttons (🔴 danger / 🟢 success / 🔵 primary / 🟡 warning)
+#      via Telegram's text-based button styling.
+#    • HD cover art for SoundCloud (original size) and Spotify (640×640 max)
+#    • "Download All" for Spotify albums & playlists, SoundCloud playlists
+#    • Live progress bars, bilingual UI (Persian / English)
+#    • Detailed statistics (daily / weekly / all-time, top users, platforms)
+#    • Smart proxy rotation for geo-restricted content
+#    • Forced channel subscription check
+#    • YouTube cookies support (cookies.txt)
+#    • Single-file bot — everything in this one file
 #
-#  This file is a self-contained single-file bot.
-#  Original code preserved in: original_backup.py
+#  Original (pyTelegramBotAPI) preserved in: original_backup.py
+#  Previous (pyTelegramBotAPI v4.1) preserved in: enhanced_bot.py
 # ============================================================
 
 import os
 import re
+import sys
+import json
+import time
+import math
+import random
 import shutil
 import sqlite3
+import logging
+import asyncio
 import tempfile
+import threading
+import subprocess
+from io import BytesIO
+from datetime import datetime, timedelta
+from contextlib import contextmanager
+from typing import Any, Optional, List, Dict, Tuple, Callable
+
+# ---- Third-party ----
 import requests
 import yt_dlp
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from telebot import apihelper
-import threading
-from flask import Flask
-import time
-import logging
-from datetime import datetime
-import random
-import json
-import queue
-from contextlib import contextmanager
+from PIL import Image
 
-# ===== Spotify (public, no API keys needed) =====
-# spotapi simulates browser requests to Spotify's public web API.
-# It does NOT require a Client ID/Secret, does NOT need login, and
-# works for all PUBLIC tracks, albums and playlists without limits.
-# If unavailable, the bot falls back to the public oEmbed endpoint.
+# ---- aiogram 3.x ----
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, Update, FSInputFile,
+    BufferedInputFile, InputMediaPhoto, InputMediaDocument, InputMediaVideo,
+    InputMediaAudio, ChatMemberUpdated, User,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter, TelegramNetworkError
+from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.client.default import DefaultBotProperties
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
+
+# ---- Spotify (public, NO API keys) ----
 try:
     from spotapi import Public as SpotapiPublic
     from spotapi import PublicAlbum as SpotapiPublicAlbum
     from spotapi import PublicPlaylist as SpotapiPublicPlaylist
     SPOTAPI_AVAILABLE = True
-except Exception as e:
-    print(f"spotapi not available (will use oEmbed fallback): {e}")
+except Exception as _e:
+    print(f"[WARN] spotapi not available (Spotify will use oEmbed fallback): {_e}")
     SPOTAPI_AVAILABLE = False
 
-# ===== Config =====
-BOT_TOKEN = "8382981392:AAEdQptMng0Zu2keWRMrfylq6wepvmULCbI"
+# ---- Optional: mutagen for ID3 tagging ----
+try:
+    from mutagen.mp3 import MP3
+    from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, TYER, APIC, COMM
+    from mutagen.flac import FLAC
+    from mutagen.mp4 import MP4, MP4Cover
+    MUTAGEN_AVAILABLE = True
+except Exception:
+    MUTAGEN_AVAILABLE = False
+
+# ============================================================
+#  Config
+# ============================================================
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8382981392:AAEdQptMng0Zu2keWRMrfylq6wepvmULCbI")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required")
-CHANNEL_USERNAME = "@TheDarkestNest"
-DB_PATH = "sc_bot.db"
-TELEGRAM_UPLOAD_LIMIT = 50 * 1024 * 1024
+
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@TheDarkestNest")
+COMPANION_ID = os.environ.get("COMPANION_ID", "@Theirodentv")
+DB_PATH = os.environ.get("DB_PATH", "aurora.db")
+COOKIES_PATH = os.environ.get("COOKIES_PATH", "cookies.txt")
+PORT = int(os.environ.get("PORT", 5000))
+
+TELEGRAM_UPLOAD_LIMIT = 50 * 1024 * 1024  # 50 MB for bots
 FORCE_MP3 = False
-COMPANION_ID = "@Theirodentv"
-PORT = int(os.environ.get('PORT', 5000))
-COOKIES_PATH = "cookies.txt"
-
-# Spotify: NO credentials needed! spotapi uses Spotify's public web API
-# by simulating browser requests. Works for all public tracks/albums/playlists.
-
-# Check if cookies file exists
 COOKIES_AVAILABLE = os.path.exists(COOKIES_PATH)
-print(f"Cookies file available: {COOKIES_AVAILABLE}")
 
-# Proxy Configuration
+os.environ['PYTHONUNBUFFERED'] = '1'
+
+# ---- Proxy Configuration (for SoundCloud / geo-blocked content) ----
 MANUAL_PROXIES = [
     "http://20.205.61.143:80",
     "http://20.205.61.142:80",
@@ -78,4890 +117,3313 @@ MANUAL_PROXIES = [
     "http://104.248.9.22:8080",
     "http://167.71.5.10:8080",
 ]
-
 ENABLE_PROXY_FOR_SOUNDCLOUD = True
 ENABLE_PROXY_ROTATION = True
 
-# Optimized settings for Replit
-os.environ['PYTHONUNBUFFERED'] = '1'
+# ============================================================
+#  Logging
+# ============================================================
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-7s | %(name)s | %(message)s',
+    datefmt='%H:%M:%S',
+)
+# Silence noisy libs
+logging.getLogger("aiogram.event_cycle").setLevel(logging.WARNING)
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+log = logging.getLogger("aurora")
+
+# ============================================================
+#  Bot & Dispatcher
+# ============================================================
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML"),
+)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
 
 # Fetch bot username with graceful fallback
-try:
-    BOT_USERNAME = bot.get_me().username
-except Exception as e:
-    print(f"Warning: could not fetch bot info at startup: {e}")
-    BOT_USERNAME = "downloader_bot"
+async def _fetch_bot_username():
+    global BOT_USERNAME
+    try:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username
+        log.info(f"Bot started as @{BOT_USERNAME}")
+    except Exception as e:
+        log.warning(f"Could not fetch bot info at startup: {e}")
+        BOT_USERNAME = "aurora_bot"
 
-apihelper.SESSION_TIMEOUT = 60
-apihelper.READ_TIMEOUT = 60
-apihelper.CONNECT_TIMEOUT = 60
+BOT_USERNAME = "aurora_bot"
 
-# ===== Connection Pool Implementation =====
+# ============================================================
+#  Database (SQLite with thread-safe connection pool)
+# ============================================================
+
 class ConnectionPool:
-    """Thread-safe connection pool for SQLite"""
-    
-    def __init__(self, db_path, max_connections=10):
+    """Thread-safe SQLite connection pool. Used from sync yt-dlp callbacks."""
+    def __init__(self, db_path: str, pool_size: int = 5):
         self.db_path = db_path
-        self.max_connections = max_connections
-        self.pool = queue.Queue(maxsize=max_connections)
-        self.lock = threading.Lock()
-        self.created_connections = 0
-        
-        # Pre-create some connections
-        for _ in range(min(3, max_connections)):
-            self._create_connection()
-    
-    def _create_connection(self):
-        """Create a new connection and add it to the pool"""
-        if self.created_connections >= self.max_connections:
-            return None
-            
+        self.pool_size = pool_size
+        self._pool: List[sqlite3.Connection] = []
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _new_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        return conn
+
+    def _init_db(self):
+        conn = self._new_conn()
         try:
-            conn = sqlite3.connect(
-                self.db_path,
-                check_same_thread=False,
-                timeout=30.0,
-                isolation_level=None  # Autocommit mode
-            )
-            # Enable WAL mode for better concurrent access
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA cache_size=10000")
-            conn.execute("PRAGMA temp_store=MEMORY")
-            
-            self.pool.put(conn)
-            self.created_connections += 1
-            return conn
-        except Exception as e:
-            print(f"Error creating connection: {e}")
-            return None
-    
-    @contextmanager
-    def get_connection(self):
-        """Get a connection from the pool"""
-        conn = None
-        try:
-            # Try to get a connection from the pool
-            try:
-                conn = self.pool.get(timeout=5.0)
-            except queue.Empty:
-                # Pool is empty, try to create a new connection
-                conn = self._create_connection()
-                if conn is None:
-                    # Still couldn't get a connection, wait and try again
-                    time.sleep(0.1)
-                    conn = self.pool.get(timeout=10.0)
-            
-            yield conn
-        except Exception as e:
-            print(f"Error getting connection: {e}")
-            if conn:
-                try:
-                    conn.rollback()
-                except:
-                    pass
-            raise
-        finally:
-            # Return the connection to the pool
-            if conn:
-                try:
-                    self.pool.put(conn, timeout=1.0)
-                except queue.Full:
-                    # Pool is full, close this connection
-                    try:
-                        conn.close()
-                        self.created_connections -= 1
-                    except:
-                        pass
-
-# Initialize connection pool
-db_pool = ConnectionPool(DB_PATH, max_connections=20)
-
-# ===== Enhanced Progress Bar Class =====
-class ProgressBar:
-    def __init__(self, chat_id, message_id, total_size=0):
-        self.chat_id = chat_id
-        self.message_id = message_id
-        self.total_size = total_size
-        self.last_update_time = 0
-        self.last_percentage = -1
-        self.update_interval = 3.0  # Update every 3 seconds minimum
-        self.percentage_threshold = 5  # Update only every 5% minimum
-        
-    def create_progress_bar(self, percentage, width=20):
-        """Create a visual progress bar"""
-        filled = int(width * percentage / 100)
-        bar = "█" * filled + "░" * (width - filled)
-        return f"[{bar}]"
-    
-    def format_progress(self, done_bytes, total_bytes):
-        """Format progress with visual bar, percentage and file sizes"""
-        if total_bytes > 0:
-            percentage = int(done_bytes * 100 / total_bytes)
-        else:
-            percentage = 0
-            
-        progress_bar = self.create_progress_bar(percentage)
-        done_str = human_size(done_bytes)
-        total_str = human_size(total_bytes)
-        
-        return f"{progress_bar} {percentage}% ({done_str}/{total_str})"
-    
-    def should_update(self, current_percentage):
-        """Check if we should update the progress message"""
-        current_time = time.time()
-        
-        # Update if it's been long enough OR significant percentage change
-        time_passed = current_time - self.last_update_time
-        percentage_change = abs(current_percentage - self.last_percentage)
-        
-        return (time_passed >= self.update_interval or 
-                percentage_change >= self.percentage_threshold or
-                current_percentage == 100)
-    
-    def update(self, done_bytes, total_bytes):
-        """Update progress with rate limiting"""
-        if total_bytes > 0:
-            current_percentage = int(done_bytes * 100 / total_bytes)
-        else:
-            current_percentage = 0
-            
-        if self.should_update(current_percentage):
-            progress_text = self.format_progress(done_bytes, total_bytes)
-            
-            try:
-                safe_edit_message(progress_text, self.chat_id, self.message_id)
-                self.last_update_time = time.time()
-                self.last_percentage = current_percentage
-                return True
-            except Exception as e:
-                print(f"Error updating progress: {e}")
-                return False
-        
-        return False
-
-# ===== Enhanced i18n =====
-LANGS = {"fa", "en"}
-T = {
-    "fa": {
-        "start": "🌐 به ربات دانلودر چند پلتفرمی خوش آمدید!\n\nاین ربات قابلیت دانلود از پلتفرم‌های مختلف را با بهترین کیفیت ممکن فراهم می‌کند. برای استفاده از ربات، لطفاً عضو کانال شوید.",
-        "fa_btn": "فارسی 🇮🇷",
-        "en_btn": "English 🇬🇧",
-        "lang_set": "زبان تنظیم شد: {lang}",
-        "send_link": "📥 لینک مورد نظرت رو بفرست تا برات دانلود کنم:\n\n🎵 SoundCloud  •  🟢 Spotify  •  🎬 YouTube\n📷 Pinterest  •  📸 Instagram\n🎵 TikTok  •  🐦 Twitter (X)\n\nیا از /search برای جستجوی آهنگ استفاده کن.\n\n💡 برای دیدن راهنما /help رو بزن.",
-        "quality_prompt": "کیفیت صوتی SoundCloud را انتخاب کن:",
-        "quality_high": "کیفیت بالا 🎧",
-        "quality_low": "کیفیت سبک 🔉",
-        "quality_set": "کیفیت تنظیم شد: {q}",
-        "downloading": "در حال دانلود... ⏳",
-        "progress": "در حال دانلود... {pct}% ({done}/{total})",
-        "invalid_link": "لطفاً لینک معتبر بده یا از /search استفاده کن.",
-        "error": "❗️خطا: {err}",
-        "stats_title": "آمار دانلود",
-        "stats_body": "کاربر: {user_count} مورد، {user_bytes}\nکل ربات: {total_count} مورد، {total_bytes}",
-        "search_prompt": "برای جستجو بنویس: /search کلمه‌کلیدی",
-        "searching": "در حال جستجو در SoundCloud... 🔎",
-        "searching_with_count": "در حال جستجو در SoundCloud... 🔎 ({count} نتیجه یافت شد)",
-        "search_results_found": "✅ {count} نتیجه پیدا شد",
-        "no_results_found": "نتیجه‌ای پیدا نشد",
-        "search_complete": "جستجو کامل شد - {count} نتیجه",
-        "processing_results": "در حال پردازش نتایج...",
-        "loading_results": "در حال بارگذاری نتایج...",
-        "pick_from_results": "از نتایج زیر انتخاب کنید:",
-        "previous_page": "⬅️ قبلی",
-        "next_page": "بعدی ➡️",
-        "page_number": "📄 {page}/{total_pages}",
-        "playlist_song_selection": "🎵 انتخاب آهنگ از پلی‌لیست:",
-        "downloading_playlist": "در حال دانلود پلی‌لیست...",
-        "processing_playlist": "در حال پردازش آهنگ‌های پلی‌لیست...",
-        "playlist_detected": "پلی‌لیست شناسایی شد. {count} آهنگ یافت شد",
-        "select_song": "انتخاب آهنگ",
-        "song_number": "آهنگ {num}",
-        "downloading_single": "در حال دانلود تک آهنگ...",
-        "preview": "پیش‌نمایش",
-        "video_preview": "پیش‌نمایش ویدیو",
-        "tiktok_preview": "پیش‌نمایش TikTok",
-        "instagram_preview": "پیش‌نمایش اینستاگرام",
-        "youtube_preview": "پیش‌نمایش یوتیوب",
-        "pinterest_preview": "پیش‌نمایش پینترست",
-        "twitter_preview": "پیش‌نمایش توییتر",
-        "search_none": "نتیجه‌ای پیدا نشد.",
-        "search_pick": "یکی را انتخاب کن:",
-        "playlist_note": "پلی‌لیست شناسایی شد. در حال ارسال ترک‌ها... 📂",
-        "cover_sent": "اینم از کاور🖼️",
-        "must_join": "برای استفاده از ربات، لطفاً عضو کانال {chan} شو.",
-        "join_btn": "عضویت در کانال",
-        "signature": "دانلود شده با 💝",
-        "features_header": "🌟 قابلیت‌های ربات:",
-        "features_lines": [
-            "🎵 <b>SoundCloud:</b> دانلود ترک تکی و پلی‌لیست، جستجو با /search، انتخاب کیفیت صوتی (بالا/سبک)، ارسال کاور و اطلاعات آهنگ",
-            "🟢 <b>Spotify:</b> دانلود ترک تکی، آلبوم و پلی‌لیست با بهترین کیفیت صوتی و کاور آهنگ",
-            "📷 <b>Pinterest:</b> دانلود عکس و ویدیو با کپشن همراه با بالاترین کیفیت ممکن",
-            "📸 <b>Instagram:</b> دانلود عکس، ویدیو و ریلز با بالاترین کیفیت و کپشن کامل",
-            "🎬 <b>YouTube:</b> دانلود ویدیوهای عادی و شورتس با انتخاب کیفیت و گزینه صرفاً صدا",
-            "🎵 <b>TikTok:</b> دانلود ویدیوهای تیک تاک با واترمارک حذف شده و اطلاعات کامل",
-            "🐦 <b>Twitter (X):</b> دانلود توییت‌ها، ویدیوها و تصاویر با بالاترین کیفیت و اطلاعات کامل",
-            "⏳ <b>نمایش پیشرفت:</b> نمایش درصد و حجم در حال دانلود به صورت زنده",
-            "📊 <b>آمار:</b> آمار تعداد و حجم دانلود کاربر و کل ربات با /stats",
-            "🔄 <b>پشتیبانی از پروکسی:</b> استفاده هوشمند از پروکسی برای دور زدن محدودیت‌های جغرافیایی",
-            "✨ <b>خوشحال میشم که عضو خونواده ی ما بشی!</b>"
-        ],
-        "companion_label": "🤝 همراه شما: {id}",
-        "close_menu": "❌ بستن منو",
-        "content_link": "لینک محتوا",
-        "top_users_all_time": "برترین کاربران (همه زمان)",
-        "top_platforms_all_time": "پلتفرم‌های برتر (همه زمان)",
-        "top_users_daily": "برترین کاربران (امروز)",
-        "top_platforms_daily": "پلتفرم‌های برتر (امروز)",
-        "top_users_weekly": "برترین کاربران (هفته)",
-        "top_platforms_weekly": "پلتفرم‌های برتر (هفته)",
-        "view_profile": "مشاهده پروفایل",
-        "back_to_stats": "بازگشت به آمار",
-        "no_data": "داده‌ای برای نمایش وجود ندارد",
-        "rank": "رتبه",
-        "user": "کاربر",
-        "downloads": "دانلودها",
-        "volume": "حجم",
-        "platform": "پلتفرم",
-        "most_used": "پراستفاده‌ترین",
-        "your_stats": "آمار شما",
-        "total_processed": "کل پردازش‌ها",
-        "uptime": "آپتایم",
-        "no_user_data": "شما هنوز فعالیتی نداشته‌اید",
-        "top_user_stats": "👑 برترین کاربران (همه زمان)",
-        "daily_top_user_stats": "📅 برترین کاربران (امروز)",
-        "weekly_top_user_stats": "📆 برترین کاربران (هفته)",
-        "top_platform_stats": "🏆 پلتفرم‌های برتر (همه زمان)",
-        "daily_top_platform_stats": "📊 پلتفرم‌های برتر (امروز)",
-        "weekly_top_platform_stats": "📈 پلتفرم‌های برتر (هفته)",
-        "your_daily_stats": "آمار روزانه شما",
-        "your_weekly_stats": "آمار هفتگی شما",
-        "choose_category": "دسته مورد نظر را انتخاب کنید:",
-        "global_stats": "آمار کل ربات",
-        "proxy_retry": "🔄 تلاش با پروکسی دیگر...",
-        "geo_restriction_error": "⚠️ محدودیت جغرافیایی detected! در حال تلاش با پروکسی...",
-        "updating_proxies": "🔄 در حال به‌روزرسانی لیست پروکسی‌ها...",
-        "proxy_found": "✅ {count} پروکسی کارآمد یافت شد",
-        # New translations for YouTube quality selection
-        "youtube_quality_prompt": "🎬 کیفیت ویدیو را انتخاب کنید:",
-        "youtube_audio_only": "فقط صدا",
-        "youtube_video_quality": "🎬 {quality}",
-        "youtube_size_info": "{size} مگابایت",
-        "youtube_processing": "در حال پردازش کیفیت‌های ممکن...",
-        "youtube_no_qualities": "هیچ کیفیت مناسب زیر ۵۰ مگابایت یافت نشد",
-        "youtube_selected_quality": "✅ کیفیت انتخاب شد: {quality}",
-        "youtube_downloading": "در حال دانلود با کیفیت {quality}...",
-        # YouTube Shorts specific
-        "youtube_shorts_detected": "🎬 YouTube Short شناسایی شد!",
-        "youtube_shorts_prompt": "گزینه دانلود رو انتخاب کن:",
-        "youtube_shorts_video": "📹 ویدیو",
-        "youtube_shorts_audio": "🎵 فقط صدا",
-        "youtube_shorts_downloading": "در حال دانلود YouTube Short...",
-        # Spotify translations (NEW)
-        "spotify_detected": "🟢 لینک اسپاتیفای شناسایی شد!",
-        "spotify_track_detected": "🎵 ترک اسپاتیفای شناسایی شد",
-        "spotify_album_detected": "💿 آلبوم اسپاتیفای شناسایی شد ({count} ترک)",
-        "spotify_playlist_detected": "📂 پلی‌لیست اسپاتیفای شناسایی شد ({count} ترک)",
-        "spotify_artist_detected": "🎤 آرتیست اسپاتیفای شناسایی شد",
-        "spotify_prompt": "گزینه دانلود رو انتخاب کن:",
-        "spotify_download_all": "📥 دانلود همه",
-        "spotify_download_single": "🎵 انتخاب ترک",
-        "spotify_download_audio": "🎵 فقط صدا (MP3)",
-        "spotify_processing": "🔍 در حال پردازش لینک اسپاتیفای...",
-        "spotify_fetching_metadata": "📋 در حال دریافت اطلاعات متادیتا...",
-        "spotify_track_count": "🎵 {count} ترک یافت شد",
-        "spotify_downloading_track": "⬇️ در حال دانلود: {title}",
-        "spotify_searching_youtube": "🔎 در حال جستجوی معادل یوتیوب...",
-        "spotify_no_match": "❌ معادلی برای این ترک پیدا نشد",
-        "spotify_partial_done": "✅ {done}/{total} ترک دانلود شد",
-        "spotify_download_complete": "🎉 دانلود اسپاتیفای کامل شد ({count} ترک)",
-        "spotify_download_failed": "❗️ دانلود برخی ترک‌ها ناموفق بود ({failed}/{total})",
-        "spotify_album_info": "💿 <b>آلبوم:</b> {name}\n🎤 <b>آرتیست:</b> {artist}\n🎵 <b>تعداد ترک:</b> {count}\n📅 <b>سال:</b> {year}",
-        "spotify_playlist_info": "📂 <b>پلی‌لیست:</b> {name}\n👤 <b>سازنده:</b> {owner}\n🎵 <b>تعداد ترک:</b> {count}",
-        "spotify_track_info": "🎵 <b>ترک:</b> {title}\n🎤 <b>آرتیست:</b> {artist}\n💿 <b>آلبوم:</b> {album}\n⏱️ <b>مدت:</b> {duration}",
-        "spotify_choose_track": "🎵 ترک مورد نظر رو از پلی‌لیست/آلبوم انتخاب کن:",
-        "spotify_invalid_url": "❌ لینک اسپاتیفای نامعتبره",
-        "spotify_unsupported_type": "❌ این نوع لینک اسپاتیفای پشتیبانی نمیشه",
-        "spotify_send_track": "🎵 ارسال ترک...",
-    },
-    "en": {
-        "start": "🌐 Welcome to the Multi-Platform Downloader Bot!\n\nThis bot provides downloading capabilities from various platforms with the best possible quality. Please join the channel to use the bot.",
-        "fa_btn": "فارسی 🇮🇷",
-        "en_btn": "English 🇬🇧",
-        "lang_set": "Language set: {lang}",
-        "send_link": "📥 Send me a link to download:\n\n🎵 SoundCloud  •  🟢 Spotify  •  🎬 YouTube\n📷 Pinterest  •  📸 Instagram\n🎵 TikTok  •  🐦 Twitter (X)\n\nOr use /search to find songs.\n\n💡 Type /help for the full guide.",
-        "quality_prompt": "Choose SoundCloud audio quality:",
-        "quality_high": "High quality 🎧",
-        "quality_low": "Light quality 🔉",
-        "quality_set": "Quality set: {q}",
-        "downloading": "Downloading... ⏳",
-        "progress": "Downloading... {pct}% ({done}/{total})",
-        "invalid_link": "Please send a valid link or use /search.",
-        "error": "❗️Error: {err}",
-        "stats_title": "Download stats",
-        "stats_body": "You: {user_count} items, {user_bytes}\nGlobal: {total_count} items, {total_bytes}",
-        "search_prompt": "To search, type: /search keyword",
-        "searching": "Searching SoundCloud... 🔎",
-        "searching_with_count": "Searching SoundCloud... 🔎 ({count} results found)",
-        "search_results_found": "✅ {count} results found",
-        "no_results_found": "No results found",
-        "search_complete": "Search complete - {count} results",
-        "processing_results": "Processing results...",
-        "loading_results": "Loading results...",
-        "pick_from_results": "Pick from the results below:",
-        "previous_page": "⬅️ Previous",
-        "next_page": "Next ➡️",
-        "page_number": "📄 {page}/{total_pages}",
-        "playlist_song_selection": "🎵 Select song from playlist:",
-        "downloading_playlist": "Downloading playlist...",
-        "processing_playlist": "Processing playlist songs...",
-        "playlist_detected": "Playlist detected. {count} songs found",
-        "select_song": "Select song",
-        "song_number": "Song {num}",
-        "downloading_single": "Downloading single track...",
-        "preview": "Preview",
-        "video_preview": "Video Preview",
-        "tiktok_preview": "TikTok Preview",
-        "instagram_preview": "Instagram Preview",
-        "youtube_preview": "YouTube Preview",
-        "pinterest_preview": "Pinterest Preview",
-        "twitter_preview": "Twitter Preview",
-        "search_none": "No results found.",
-        "search_pick": "Pick one:",
-        "playlist_note": "Playlist detected. Sending tracks... 📂",
-        "cover_sent": "Cover art sent 🖼️",
-        "must_join": "To use the bot, please join {chan}.",
-        "join_btn": "Join channel",
-        "signature": "Downloaded With 💝",
-        "features_header": "🌟 Bot Features:",
-        "features_lines": [
-            "🎵 <b>SoundCloud:</b> Download single tracks and playlists, search via /search, choose audio quality (high/light), send cover and metadata",
-            "🟢 <b>Spotify:</b> Download single tracks, albums and playlists in best audio quality with cover art",
-            "📷 <b>Pinterest:</b> Download images and videos with captions and in highest quality",
-            "📸 <b>Instagram:</b> Download photos, videos and reels with highest quality and full captions",
-            "🎬 <b>YouTube:</b> Download regular videos and Shorts with quality selection and audio-only option",
-            "🎵 <b>TikTok:</b> Download TikTok videos without watermark and complete information",
-            "🐦 <b>Twitter (X):</b> Download tweets, videos and images with highest quality and complete information",
-            "⏳ <b>Progress Display:</b> Live download percentage and size display",
-            "📊 <b>Statistics:</b> User and global counts and sizes via /stats",
-            "🔄 <b>Proxy Support:</b> Smart proxy usage to bypass geo-restrictions",
-            "✨ <b>I'll Be Happy To Have You In Our Family!</b>"
-        ],
-        "companion_label": "🤝 Your companion: {id}",
-        "close_menu": "❌ Close Menu",
-        "content_link": "Content Link",
-        "top_users_all_time": "Top Users (All Time)",
-        "top_platforms_all_time": "Top Platforms (All Time)",
-        "top_users_daily": "Top Users (Daily)",
-        "top_platforms_daily": "Top Platforms (Daily)",
-        "top_users_weekly": "Top Users (Weekly)",
-        "top_platforms_weekly": "Top Platforms (Weekly)",
-        "view_profile": "View Profile",
-        "back_to_stats": "Back to Stats",
-        "no_data": "No data available",
-        "rank": "Rank",
-        "user": "User",
-        "downloads": "Downloads",
-        "volume": "Volume",
-        "platform": "Platform",
-        "most_used": "Most Used",
-        "your_stats": "Your Stats",
-        "total_processed": "Total Processed",
-        "uptime": "Uptime",
-        "no_user_data": "You have no activity yet",
-        "top_user_stats": "👑 Top Users (All Time)",
-        "daily_top_user_stats": "📅 Top Users (Daily)",
-        "weekly_top_user_stats": "📆 Top Users (Weekly)",
-        "top_platform_stats": "🏆 Top Platforms (All Time)",
-        "daily_top_platform_stats": "📊 Top Platforms (Daily)",
-        "weekly_top_platform_stats": "📈 Top Platforms (Weekly)",
-        "your_daily_stats": "Your Daily Stats",
-        "your_weekly_stats": "Your Weekly Stats",
-        "choose_category": "Choose a category:",
-        "global_stats": "Global Bot Stats",
-        "proxy_retry": "🔄 Retrying with another proxy...",
-        "geo_restriction_error": "⚠️ Geo-restriction detected! Trying with proxy...",
-        "updating_proxies": "🔄 Updating proxy list...",
-        "proxy_found": "✅ {count} working proxies found",
-        # New translations for YouTube quality selection
-        "youtube_quality_prompt": "🎬 Choose video quality:",
-        "youtube_audio_only": "Audio Only",
-        "youtube_video_quality": "🎬 {quality}",
-        "youtube_size_info": "{size} MB",
-        "youtube_processing": "Processing available qualities...",
-        "youtube_no_qualities": "No suitable qualities under 50MB found",
-        "youtube_selected_quality": "✅ Quality selected: {quality}",
-        "youtube_downloading": "Downloading with {quality} quality...",
-        # YouTube Shorts specific
-        "youtube_shorts_detected": "🎬 YouTube Short detected!",
-        "youtube_shorts_prompt": "Choose download option:",
-        "youtube_shorts_video": "📹 Video",
-        "youtube_shorts_audio": "🎵 Audio only",
-        "youtube_shorts_downloading": "Downloading YouTube Short...",
-        # Spotify translations (NEW)
-        "spotify_detected": "🟢 Spotify link detected!",
-        "spotify_track_detected": "🎵 Spotify track detected",
-        "spotify_album_detected": "💿 Spotify album detected ({count} tracks)",
-        "spotify_playlist_detected": "📂 Spotify playlist detected ({count} tracks)",
-        "spotify_artist_detected": "🎤 Spotify artist detected",
-        "spotify_prompt": "Choose download option:",
-        "spotify_download_all": "📥 Download All",
-        "spotify_download_single": "🎵 Pick a Track",
-        "spotify_download_audio": "🎵 Audio Only (MP3)",
-        "spotify_processing": "🔍 Processing Spotify link...",
-        "spotify_fetching_metadata": "📋 Fetching metadata...",
-        "spotify_track_count": "🎵 {count} tracks found",
-        "spotify_downloading_track": "⬇️ Downloading: {title}",
-        "spotify_searching_youtube": "🔎 Searching YouTube equivalent...",
-        "spotify_no_match": "❌ No match found for this track",
-        "spotify_partial_done": "✅ {done}/{total} tracks downloaded",
-        "spotify_download_complete": "🎉 Spotify download complete ({count} tracks)",
-        "spotify_download_failed": "❗️ Some tracks failed to download ({failed}/{total})",
-        "spotify_album_info": "💿 <b>Album:</b> {name}\n🎤 <b>Artist:</b> {artist}\n🎵 <b>Tracks:</b> {count}\n📅 <b>Year:</b> {year}",
-        "spotify_playlist_info": "📂 <b>Playlist:</b> {name}\n👤 <b>Owner:</b> {owner}\n🎵 <b>Tracks:</b> {count}",
-        "spotify_track_info": "🎵 <b>Track:</b> {title}\n🎤 <b>Artist:</b> {artist}\n💿 <b>Album:</b> {album}\n⏱️ <b>Duration:</b> {duration}",
-        "spotify_choose_track": "🎵 Pick a track from the album/playlist:",
-        "spotify_invalid_url": "❌ Invalid Spotify link",
-        "spotify_unsupported_type": "❌ This Spotify link type is not supported",
-        "spotify_send_track": "🎵 Sending track...",
-    },
-}
-
-def tr(chat_id, key, **kwargs):
-    lang = get_user_lang(chat_id) or "en"
-    text = T.get(lang, T["en"]).get(key, key)
-    return text.format(**kwargs) if kwargs else text
-
-# ===== Enhanced Proxy Management =====
-class ProxyManager:
-    def __init__(self):
-        self.working_proxies = []
-        self.failed_proxies = []
-        self.last_update = 0
-        self.manual_proxies = MANUAL_PROXIES.copy()
-        
-    def fetch_free_proxies(self) -> list:
-        """Fetch free proxies from multiple sources"""
-        proxies = []
-        
-        try:
-            # Source 1: ProxyScrape US proxies
-            url = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&country=us&proxy_format=protocolipport&format=text&timeout=619"
-            response = requests.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                proxy_text = response.text.strip()
-                proxy_lines = proxy_text.split('\n')
-                
-                for line in proxy_lines:
-                    line = line.strip()
-                    if line and ':' in line:
-                        if not line.startswith(('http://', 'https://', 'socks5://')):
-                            proxies.append(f"http://{line}")
-                        else:
-                            proxies.append(line)
-                
-                print(f"Fetched {len(proxies)} US proxies from ProxyScrape")
-            else:
-                print(f"Failed to fetch US proxies: HTTP {response.status_code}")
-                
-        except Exception as e:
-            print(f"Error fetching US proxies: {e}")
-        
-        try:
-            # Source 2: ProxyScrape all countries (backup)
-            url = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=619"
-            response = requests.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                proxy_text = response.text.strip()
-                proxy_lines = proxy_text.split('\n')
-                
-                for line in proxy_lines[:1000]:  # Limit to first 1000
-                    line = line.strip()
-                    if line and ':' in line:
-                        if not line.startswith(('http://', 'https://', 'socks5://')):
-                            proxies.append(f"http://{line}")
-                        else:
-                            proxies.append(line)
-                
-                print(f"Fetched additional {len(proxy_lines[:1000])} backup proxies")
-        except Exception as e:
-            print(f"Error fetching backup proxies: {e}")
-        
-        # Remove duplicates and shuffle
-        proxies = list(set(proxies))
-        random.shuffle(proxies)
-        
-        print(f"Total unique proxies: {len(proxies)}")
-        return proxies
-    
-    def test_proxy(self, proxy_url: str, timeout: int = 5) -> bool:
-        """Test if a proxy is working for SoundCloud"""
-        try:
-            proxies = {'http': proxy_url, 'https': proxy_url}
-            
-            # First test basic connectivity
-            response = requests.get('http://httpbin.org/ip', proxies=proxies, timeout=timeout)
-            if response.status_code != 200:
-                return False
-            
-            # Test if proxy can access SoundCloud (critical for geo-restriction)
-            try:
-                soundcloud_test = requests.get('https://soundcloud.com/', proxies=proxies, timeout=timeout)
-                if soundcloud_test.status_code == 200:
-                    return True
-            except:
-                # If SoundCloud test fails but basic test passed, still consider it working
-                return True
-                
-        except:
-            return False
-    
-    def get_working_proxy(self, max_retries: int = 10) -> str:
-        """Get a working proxy, testing multiple if needed"""
-        
-        # Update proxy list if it's old or empty
-        if time.time() - self.last_update > 1800 or not self.working_proxies:  # Update every 30 minutes
-            self.update_proxy_list()
-        
-        # Try manual/proven proxies first
-        for _ in range(max_retries):
-            if self.manual_proxies:
-                proxy = random.choice(self.manual_proxies)
-                if self.test_proxy(proxy, timeout=3):
-                    return proxy
-        
-        # Try working proxies
-        for _ in range(max_retries):
-            if self.working_proxies:
-                proxy = random.choice(self.working_proxies)
-                if self.test_proxy(proxy, timeout=3):
-                    return proxy
-                else:
-                    self.working_proxies.remove(proxy)
-                    self.failed_proxies.append(proxy)
-        
-        # Try failed proxies (they might work now)
-        random.shuffle(self.failed_proxies)
-        for proxy in self.failed_proxies[:max_retries]:
-            if self.test_proxy(proxy, timeout=3):
-                self.failed_proxies.remove(proxy)
-                self.working_proxies.append(proxy)
-                return proxy
-        
-        # Fetch and test new proxies if all failed
-        print("All proxies failed, fetching fresh ones...")
-        new_proxies = self.fetch_free_proxies()
-        for proxy in new_proxies[:max_retries * 2]:  # Test more proxies
-            if self.test_proxy(proxy, timeout=3):
-                self.working_proxies.append(proxy)
-                return proxy
-        
-        return None
-    
-    def get_alternative_proxy_format(self, proxy_url: str) -> str:
-        """Try to convert HTTP proxy to SOCKS5 format for better compatibility"""
-        if proxy_url.startswith('http://'):
-            # Extract IP and port
-            parts = proxy_url.replace('http://', '').split(':')
-            if len(parts) == 2:
-                ip, port = parts
-                # Try SOCKS5 format (some services support this)
-                return f"socks5://{ip}:{port}"
-        return proxy_url
-    
-    def update_proxy_list(self):
-        """Update proxy list with fresh proxies"""
-        print("Updating proxy list...")
-        
-        # Clear old working proxies
-        self.working_proxies = []
-        
-        # Start with manual proxies
-        all_proxies = self.manual_proxies.copy()
-        
-        # Add free proxies
-        free_proxies = self.fetch_free_proxies()
-        all_proxies.extend(free_proxies)
-        
-        print(f"Fetched {len(free_proxies)} proxies from ProxyScrape")
-        
-        # Test more proxies to find working ones
-        tested_count = 0
-        working_count = 0
-        for proxy in all_proxies:
-            if tested_count >= 100:  # Limit testing to first 100 proxies
-                break
-            if working_count >= 25:  # Keep only 25 working proxies
-                break
-                
-            tested_count += 1
-            if self.test_proxy(proxy, timeout=3):
-                self.working_proxies.append(proxy)
-                working_count += 1
-                print(f"Working proxy #{working_count}: {proxy}")
-        
-        self.last_update = time.time()
-        print(f"Proxy list updated: {len(self.working_proxies)} working proxies (tested {tested_count})")
-        
-        return len(self.working_proxies)
-    
-    def get_proxy_stats(self) -> dict:
-        """Get statistics about proxy performance"""
-        return {
-            "working_proxies": len(self.working_proxies),
-            "failed_proxies": len(self.failed_proxies),
-            "manual_proxies": len(self.manual_proxies),
-            "last_update": self.last_update
-        }
-
-# Initialize proxy manager
-proxy_manager = ProxyManager()# Telegram Downloader Bot: Enhanced Version - Part 2
-# Database Functions and Helper Classes with Connection Pooling
-
-# ===== DB Functions with Connection Pooling =====
-def db_init():
-    """Initialize database with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-
-        # Existing tables
-        c.execute("CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, lang TEXT, quality TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS stats (chat_id INTEGER, count INTEGER, bytes INTEGER)")
-        c.execute("CREATE TABLE IF NOT EXISTS totals (id INTEGER PRIMARY KEY, count INTEGER, bytes INTEGER)")
-        c.execute("CREATE TABLE IF NOT EXISTS search_cache (chat_id INTEGER, idx INTEGER, url TEXT, title TEXT, artist TEXT, duration INTEGER)")
-        c.execute("CREATE TABLE IF NOT EXISTS playlist_cache (chat_id INTEGER, idx INTEGER, url TEXT, title TEXT, artist TEXT, duration INTEGER)")
-
-        # New tables for advanced statistics
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS detailed_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                language TEXT DEFAULT 'fa',
+                quality TEXT DEFAULT 'high',
+                joined_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS stats (
                 chat_id INTEGER,
                 platform TEXT,
                 file_type TEXT,
                 file_size INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (chat_id) REFERENCES users (chat_id)
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS uptime_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                start_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-                total_downloads INTEGER DEFAULT 0,
-                total_processed INTEGER DEFAULT 0
-            )
-        """)
-
-        # New table for YouTube quality cache
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS youtube_quality_cache (
-                chat_id INTEGER PRIMARY KEY,
-                url TEXT,
-                qualities TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # New table for YouTube Shorts cache
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS youtube_shorts_cache (
-                chat_id INTEGER PRIMARY KEY,
-                url TEXT,
-                is_short BOOLEAN,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # New table for Spotify metadata cache (stores parsed track lists)
-        c.execute("""
+                timestamp TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_stats_chat ON stats(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_stats_ts ON stats(timestamp);
             CREATE TABLE IF NOT EXISTS spotify_cache (
-                chat_id INTEGER PRIMARY KEY,
+                chat_id INTEGER,
                 url TEXT,
                 content_type TEXT,
                 tracks_json TEXT,
                 meta_json TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+                created_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (chat_id, url)
+            );
+            CREATE TABLE IF NOT EXISTS youtube_quality_cache (
+                chat_id INTEGER, url TEXT, qualities_json TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (chat_id, url)
+            );
+            CREATE TABLE IF NOT EXISTS youtube_shorts_cache (
+                chat_id INTEGER, url TEXT, is_short INTEGER,
+                created_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (chat_id, url)
+            );
+            CREATE TABLE IF NOT EXISTS search_choices (
+                chat_id INTEGER, idx INTEGER, choice_json TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (chat_id, idx)
+            );
+            CREATE TABLE IF NOT EXISTS playlist_choices (
+                chat_id INTEGER, idx INTEGER, choice_json TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (chat_id, idx)
+            );
+            """)
+            conn.commit()
+        finally:
+            conn.close()
 
-        c.execute("INSERT OR IGNORE INTO totals (id, count, bytes) VALUES (1, 0, 0)")
-        c.execute("INSERT OR IGNORE INTO uptime_stats (id, total_downloads, total_processed) VALUES (1, 0, 0)")
-
-        # Create indexes for better performance
-        c.execute("CREATE INDEX IF NOT EXISTS idx_detailed_stats_chat_id ON detailed_stats(chat_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_detailed_stats_timestamp ON detailed_stats(timestamp)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_detailed_stats_platform ON detailed_stats(platform)")
-
-        conn.commit()
-
-# ===== Spotify cache helpers =====
-def save_spotify_cache(chat_id, url, content_type, tracks, meta=None):
-    """Save parsed Spotify track list for a user."""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute(
-            "INSERT OR REPLACE INTO spotify_cache (chat_id, url, content_type, tracks_json, meta_json) VALUES (?, ?, ?, ?, ?)",
-            (chat_id, url, content_type, json.dumps(tracks), json.dumps(meta or {}))
-        )
-        conn.commit()
-
-def get_spotify_cache(chat_id):
-    """Return (url, content_type, tracks, meta) for the user's cached Spotify link."""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT url, content_type, tracks_json, meta_json FROM spotify_cache WHERE chat_id=?", (chat_id,))
-        row = c.fetchone()
-        if not row:
-            return None
+    @contextmanager
+    def get_conn(self):
+        conn = None
+        with self._lock:
+            if self._pool:
+                conn = self._pool.pop()
+        if conn is None:
+            conn = self._new_conn()
         try:
-            tracks = json.loads(row[2]) if row[2] else []
+            yield conn
+            conn.commit()
         except Exception:
-            tracks = []
-        try:
-            meta = json.loads(row[3]) if row[3] else {}
-        except Exception:
-            meta = {}
-        return {"url": row[0], "content_type": row[1], "tracks": tracks, "meta": meta}
+            conn.rollback()
+            raise
+        finally:
+            with self._lock:
+                if len(self._pool) < self.pool_size:
+                    self._pool.append(conn)
+                else:
+                    conn.close()
 
-def clear_spotify_cache(chat_id):
-    """Clear Spotify cache for a user."""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM spotify_cache WHERE chat_id=?", (chat_id,))
-        conn.commit()
+db_pool = ConnectionPool(DB_PATH)
 
-def get_user_lang(chat_id):
-    """Get user language with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT lang FROM users WHERE chat_id=?", (chat_id,))
-        row = c.fetchone()
-        return row[0] if row and row[0] in LANGS else None
+# ============================================================
+#  i18n — bilingual (Persian / English)
+# ============================================================
 
-def set_user_lang(chat_id, lang):
-    """Set user language with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO users (chat_id, lang, quality) VALUES (?, ?, COALESCE((SELECT quality FROM users WHERE chat_id=?),'high'))", (chat_id, lang, chat_id))
-        conn.commit()
+LANG_STRINGS = {
+    'fa': {
+        # /start & general
+        'welcome': "🌟 به <b>{bot_name}</b> خوش اومدی!\n\n"
+                   "ربات دانلودر همه‌کاره شما با پشتیبانی از ۷ پلتفرم.\n"
+                   "یک لینک بفرست تا کارمونو شروع کنیم 🚀",
+        'welcome_back': "👋 خوش برگشتی <b>{name}</b>!\n\nیه لینک بفرست تا برات دانلود کنم 📥",
+        'send_link': "🔗 لینک موردنظر رو بفرست:\n\n"
+                     "<blockquote>🎵 <b>SoundCloud</b> — ترک / پلی‌لیست / آلبوم / جستجو\n"
+                     "🎧 <b>Spotify</b> — ترک / آلبوم / پلی‌لیست\n"
+                     "📺 <b>YouTube</b> — ویدیو / شورتز\n"
+                     "📌 <b>Pinterest</b> — ویدیو / عکس\n"
+                     "📸 <b>Instagram</b> — ریلز / پست\n"
+                     "🎵 <b>TikTok</b> — ویدیو\n"
+                     "🐦 <b>Twitter / X</b> — ویدیو / گیف</blockquote>",
+        'features_title': "✨ <b>امکانات ربات</b>",
+        'features_lines': (
+            "🎵 <b>SoundCloud</b> — دانلود با بالاترین کیفیت + کاور HD\n"
+            "🎧 <b>Spotify</b> — ترک / آلبوم / پلی‌لیست (بدون نیاز به API)\n"
+            "📺 <b>YouTube</b> — ویدیو و شورتز با انتخاب کیفیت\n"
+            "📌 <b>Pinterest</b> — ویدیو و عکس با کیفیت اصلی\n"
+            "📸 <b>Instagram</b> — ریلز و پست\n"
+            "🎵 <b>TikTok</b> — ویدیو بدون واترمارک\n"
+            "🐦 <b>Twitter / X</b> — ویدیو و گیف\n\n"
+            "📊 <b>آمار کامل</b> — روزانه / هفتگی / کل زمان\n"
+            "🌐 <b>دو زبانه</b> — فارسی / English\n"
+            "🔄 <b>پروکسی هوشمند</b> — برای محتوای محدودشده\n"
+            "🎨 <b>دکمه‌های رنگی</b> — رابط کاربری زیبا\n"
+            "📥 <b>دانلود گروهی</b> — برای آلبوم و پلی‌لیست"
+        ),
+        # Platform names
+        'platform_spotify': "Spotify",
+        'platform_soundcloud': "SoundCloud",
+        'platform_youtube': "YouTube",
+        'platform_pinterest': "Pinterest",
+        'platform_instagram': "Instagram",
+        'platform_tiktok': "TikTok",
+        'platform_twitter': "Twitter",
+        # Channel subscription
+        'must_join': "🔒 برای استفاده از ربات، ابتدا باید عضو کانال شوید:",
+        'joined_check': "✅ چک کردم — الان میتونی از ربات استفاده کنی!",
+        'join_btn': "📢 عضویت در کانال",
+        'check_btn': "🔄 بررسی عضویت",
+        # Processing
+        'processing': "⏳ در حال پردازش...",
+        'downloading': "⬇️ در حال دانلود...",
+        'uploading': "⬆️ در حال آپلود...",
+        'done': "✅ انجام شد!",
+        'failed': "❌ خطا",
+        'cancelled': "🚫 لغو شد",
+        # Errors
+        'err_invalid_url': "❌ لینک نامعتبره. یه لینک درست بفرست.",
+        'err_not_supported': "❌ این نوع لینک پشتیبانی نمیشه.",
+        'err_download': "❌ دانلود ناموفق بود. بعدا دوباره امتحان کن.",
+        'err_too_large': "❌ فایل بزرگتر از حد مجاز تلگرامه (۵۰ مگابایت).",
+        'err_no_video': "❌ توی این لینک ویدیویی پیدا نشد.",
+        'err_private': "❌ این محتوا خصوصیه یا در دسترس نیست.",
+        'err_rate_limit': "⏳ تلگرام محدودیت اعمال کرده. چند ثانیه بعد دوباره امتحان کن.",
+        # Spotify
+        'sp_track': "🎵 ترک",
+        'sp_album': "💿 آلبوم",
+        'sp_playlist': "📋 پلی‌لیست",
+        'sp_tracks_count': "تعداد ترک‌ها",
+        'sp_by': "هنرمند",
+        'sp_download_all': "📥 دانلود همه",
+        'sp_pick_track': "🔍 انتخاب ترک",
+        'sp_downloading_all': "📥 در حال دانلود همه ترک‌ها...",
+        'sp_progress': "📊 پیشرفت: {done}/{total}",
+        'sp_no_tracks': "❌ ترکی پیدا نشد.",
+        'sp_searching': "🔍 در حال جستجوی ترک در یوتیوب...",
+        'sp_track_x_of_y': "🎧 ترک {cur} از {total}",
+        'sp_album_cover': "🖼️ کاور آلبوم (HD)",
+        'sp_playlist_cover': "🖼️ کاور پلی‌لیست (HD)",
+        # SoundCloud
+        'sc_searching': "🔍 در حال جستجو در SoundCloud...",
+        'sc_no_results': "❌ چیزی پیدا نشد.",
+        'sc_search_results': "🔍 نتایج جستجو",
+        'sc_pick_track': "🎵 یه ترک انتخاب کن:",
+        'sc_quality': "🎵 انتخاب کیفیت SoundCloud:",
+        'sc_quality_high': "高品质 High Quality (320kbps)",
+        'sc_quality_medium': "🎵 Medium (128kbps)",
+        'sc_quality_low': "🎵 Low (64kbps)",
+        # YouTube
+        'yt_quality': "📺 انتخاب کیفیت YouTube:",
+        'yt_video_audio': "🎬 ویدیو + صدا",
+        'yt_audio_only': "🎵 فقط صدا (MP3)",
+        'yt_shorts_detected': "📱 شورتز شناسایی شد!",
+        'yt_best_quality': "🏆 بهترین کیفیت",
+        'yt_no_formats': "❌ فرمتی پیدا نشد. ممکنه نیاز به cookies باشه.",
+        # Stats
+        'stats_title': "📊 <b>آمار شما</b>",
+        'stats_total': "📥 کل دانلودها",
+        'stats_total_size': "💾 حجم کل",
+        'stats_by_platform': "📈 بر اساس پلتفرم",
+        'stats_top_users': "🏆 برترین کاربران",
+        'stats_period_all': "📊 کل زمان",
+        'stats_period_weekly': "📅 هفتگی",
+        'stats_period_daily': "📅 روزانه",
+        'stats_no_data': "📭 هنوز دانلودی ندارید.",
+        # Menu
+        'menu_main': "🏠 منوی اصلی",
+        'menu_quality': "🎵 کیفیت",
+        'menu_language': "🌐 زبان",
+        'menu_stats': "📊 آمار",
+        'menu_help': "❓ راهنما",
+        'menu_search': "🔍 جستجو",
+        'menu_back': "🔙 بازگشت",
+        'menu_cancel': "🚫 لغو",
+        # Language
+        'lang_current': "🌐 زبان فعلی: <b>{lang}</b>",
+        'lang_fa': "🇮🇷 فارسی",
+        'lang_en': "🇬🇧 English",
+        # Help
+        'help_text': (
+            "❓ <b>راهنما</b>\n\n"
+            "🔗 فقط لینک محتوایی که میخوای دانلود کنی رو بفرست.\n\n"
+            "<b>پلتفرم‌های پشتیبانی‌شده:</b>\n"
+            "• SoundCloud (ترک/پلی‌لیست/آلبوم/جستجو)\n"
+            "• Spotify (ترک/آلبوم/پلی‌لیست)\n"
+            "• YouTube (ویدیو/شورتز)\n"
+            "• Pinterest (ویدیو/عکس)\n"
+            "• Instagram (ریلز/پست)\n"
+            "• TikTok (ویدیو)\n"
+            "• Twitter/X (ویدیو/گیف)\n\n"
+            "<b>دستورات:</b>\n"
+            "/start — شروع\n"
+            "/menu — منوی اصلی\n"
+            "/help — راهنما\n"
+            "/lang — تغییر زبان\n"
+            "/quality — تغییر کیفیت\n"
+            "/stats — آمار\n"
+            "/search — جستجو در SoundCloud"
+        ),
+        # Quality
+        'quality_set': "✅ کیفیت روی <b>{quality}</b> تنظیم شد.",
+        'quality_current': "🎵 کیفیت فعلی: <b>{quality}</b>",
+        # Search
+        'search_prompt': "🔍 عبارت جستجو رو بفرست (SoundCloud):",
+        'search_no_query': "❌ عبارت جستجو رو بعد از /search بنویس یا فقط عبارت رو بفرست.",
+        # Progress
+        'progress_downloading': "⬇️ دانلود: {percent}% ({done}/{total})",
+        'progress_extracting': "🔍 استخراج اطلاعات...",
+        'progress_converting': "🔄 تبدیل فرمت...",
+        'progress_uploading': "⬆️ آپلود: {percent}%",
+        # Caption
+        'caption_title': "🎵 عنوان",
+        'caption_artist': "🎤 هنرمند",
+        'caption_album': "💿 آلبوم",
+        'caption_duration': "⏱️ مدت",
+        'caption_quality': " bitrate",
+        'caption_platform': "📲 پلتفرم",
+        'caption_size': "💾 حجم",
+        'caption_uploaded_by': "👤 ارسال توسط",
+        # Buttons
+        'btn_download_all': "📥 دانلود همه ({count})",
+        'btn_pick_track': "🔍 انتخاب ترک",
+        'btn_cancel': "🚫 لغو",
+        'btn_back': "🔙 بازگشت",
+        'btn_next': "➡️ بعدی",
+        'btn_prev': "⬅️ قبلی",
+        'btn_close': "✖️ بستن",
+        'btn_audio_only': "🎵 فقط صدا",
+        'btn_video': "🎬 ویدیو",
+        'btn_best': "🏆 بهترین",
+        # Misc
+        'unknown_artist': "هنرمند ناشناخته",
+        'unknown_album': "نامشخص",
+        'seconds': "ثانیه",
+        'minutes': "دقیقه",
+        'hours': "ساعت",
+    },
+    'en': {
+        'welcome': "🌟 Welcome to <b>{bot_name}</b>!\n\n"
+                   "Your all-in-one downloader bot supporting 7 platforms.\n"
+                   "Send a link to get started 🚀",
+        'welcome_back': "👋 Welcome back <b>{name}</b>!\n\nSend me a link to download 📥",
+        'send_link': "🔗 Send me a link:\n\n"
+                     "<blockquote>🎵 <b>SoundCloud</b> — track / playlist / album / search\n"
+                     "🎧 <b>Spotify</b> — track / album / playlist\n"
+                     "📺 <b>YouTube</b> — video / Shorts\n"
+                     "📌 <b>Pinterest</b> — video / image\n"
+                     "📸 <b>Instagram</b> — reel / post\n"
+                     "🎵 <b>TikTok</b> — video\n"
+                     "🐦 <b>Twitter / X</b> — video / gif</blockquote>",
+        'features_title': "✨ <b>Bot Features</b>",
+        'features_lines': (
+            "🎵 <b>SoundCloud</b> — best quality download + HD cover\n"
+            "🎧 <b>Spotify</b> — track / album / playlist (no API keys needed)\n"
+            "📺 <b>YouTube</b> — videos and Shorts with quality picker\n"
+            "📌 <b>Pinterest</b> — video and image at original quality\n"
+            "📸 <b>Instagram</b> — reels and posts\n"
+            "🎵 <b>TikTok</b> — video without watermark\n"
+            "🐦 <b>Twitter / X</b> — video and gifs\n\n"
+            "📊 <b>Full stats</b> — daily / weekly / all-time\n"
+            "🌐 <b>Bilingual</b> — Persian / English\n"
+            "🔄 <b>Smart proxy</b> — for geo-restricted content\n"
+            "🎨 <b>Coloured buttons</b> — beautiful UI\n"
+            "📥 <b>Bulk download</b> — for albums and playlists"
+        ),
+        'platform_spotify': "Spotify",
+        'platform_soundcloud': "SoundCloud",
+        'platform_youtube': "YouTube",
+        'platform_pinterest': "Pinterest",
+        'platform_instagram': "Instagram",
+        'platform_tiktok': "TikTok",
+        'platform_twitter': "Twitter",
+        'must_join': "🔒 To use this bot, you must first join our channel:",
+        'joined_check': "✅ Checked — you can now use the bot!",
+        'join_btn': "📢 Join Channel",
+        'check_btn': "🔄 Check Membership",
+        'processing': "⏳ Processing...",
+        'downloading': "⬇️ Downloading...",
+        'uploading': "⬆️ Uploading...",
+        'done': "✅ Done!",
+        'failed': "❌ Failed",
+        'cancelled': "🚫 Cancelled",
+        'err_invalid_url': "❌ Invalid link. Please send a valid URL.",
+        'err_not_supported': "❌ This link type is not supported.",
+        'err_download': "❌ Download failed. Please try again later.",
+        'err_too_large': "❌ File exceeds Telegram's 50 MB limit.",
+        'err_no_video': "❌ No video found in this link.",
+        'err_private': "❌ This content is private or unavailable.",
+        'err_rate_limit': "⏳ Telegram rate-limited. Try again in a few seconds.",
+        'sp_track': "🎵 Track",
+        'sp_album': "💿 Album",
+        'sp_playlist': "📋 Playlist",
+        'sp_tracks_count': "Tracks count",
+        'sp_by': "Artist",
+        'sp_download_all': "📥 Download All",
+        'sp_pick_track': "🔍 Pick a track",
+        'sp_downloading_all': "📥 Downloading all tracks...",
+        'sp_progress': "📊 Progress: {done}/{total}",
+        'sp_no_tracks': "❌ No tracks found.",
+        'sp_searching': "🔍 Searching YouTube for the track...",
+        'sp_track_x_of_y': "🎧 Track {cur} of {total}",
+        'sp_album_cover': "🖼️ Album cover (HD)",
+        'sp_playlist_cover': "🖼️ Playlist cover (HD)",
+        'sc_searching': "🔍 Searching SoundCloud...",
+        'sc_no_results': "❌ No results found.",
+        'sc_search_results': "🔍 Search results",
+        'sc_pick_track': "🎵 Pick a track:",
+        'sc_quality': "🎵 Select SoundCloud quality:",
+        'sc_quality_high': "🎵 High Quality (320kbps)",
+        'sc_quality_medium': "🎵 Medium (128kbps)",
+        'sc_quality_low': "🎵 Low (64kbps)",
+        'yt_quality': "📺 Select YouTube quality:",
+        'yt_video_audio': "🎬 Video + Audio",
+        'yt_audio_only': "🎵 Audio only (MP3)",
+        'yt_shorts_detected': "📱 Shorts detected!",
+        'yt_best_quality': "🏆 Best quality",
+        'yt_no_formats': "❌ No format found. Cookies may be required.",
+        'stats_title': "📊 <b>Your stats</b>",
+        'stats_total': "📥 Total downloads",
+        'stats_total_size': "💾 Total size",
+        'stats_by_platform': "📈 By platform",
+        'stats_top_users': "🏆 Top users",
+        'stats_period_all': "📊 All-time",
+        'stats_period_weekly': "📅 Weekly",
+        'stats_period_daily': "📅 Daily",
+        'stats_no_data': "📭 No downloads yet.",
+        'menu_main': "🏠 Main menu",
+        'menu_quality': "🎵 Quality",
+        'menu_language': "🌐 Language",
+        'menu_stats': "📊 Stats",
+        'menu_help': "❓ Help",
+        'menu_search': "🔍 Search",
+        'menu_back': "🔙 Back",
+        'menu_cancel': "🚫 Cancel",
+        'lang_current': "🌐 Current language: <b>{lang}</b>",
+        'lang_fa': "🇮🇷 فارسی",
+        'lang_en': "🇬🇧 English",
+        'help_text': (
+            "❓ <b>Help</b>\n\n"
+            "🔗 Just send a link to the content you want to download.\n\n"
+            "<b>Supported platforms:</b>\n"
+            "• SoundCloud (track/playlist/album/search)\n"
+            "• Spotify (track/album/playlist)\n"
+            "• YouTube (video/Shorts)\n"
+            "• Pinterest (video/image)\n"
+            "• Instagram (reel/post)\n"
+            "• TikTok (video)\n"
+            "• Twitter/X (video/gif)\n\n"
+            "<b>Commands:</b>\n"
+            "/start — Start\n"
+            "/menu — Main menu\n"
+            "/help — Help\n"
+            "/lang — Change language\n"
+            "/quality — Change quality\n"
+            "/stats — Stats\n"
+            "/search — Search on SoundCloud"
+        ),
+        'quality_set': "✅ Quality set to <b>{quality}</b>.",
+        'quality_current': "🎵 Current quality: <b>{quality}</b>",
+        'search_prompt': "🔍 Send your search query (SoundCloud):",
+        'search_no_query': "❌ Send a query after /search, or just send the query.",
+        'progress_downloading': "⬇️ Download: {percent}% ({done}/{total})",
+        'progress_extracting': "🔍 Extracting info...",
+        'progress_converting': "🔄 Converting format...",
+        'progress_uploading': "⬆️ Upload: {percent}%",
+        'caption_title': "🎵 Title",
+        'caption_artist': "🎤 Artist",
+        'caption_album': "💿 Album",
+        'caption_duration': "⏱️ Duration",
+        'caption_quality': "🎧 Bitrate",
+        'caption_platform': "📲 Platform",
+        'caption_size': "💾 Size",
+        'caption_uploaded_by': "👤 Sent by",
+        'btn_download_all': "📥 Download All ({count})",
+        'btn_pick_track': "🔍 Pick a track",
+        'btn_cancel': "🚫 Cancel",
+        'btn_back': "🔙 Back",
+        'btn_next': "➡️ Next",
+        'btn_prev': "⬅️ Prev",
+        'btn_close': "✖️ Close",
+        'btn_audio_only': "🎵 Audio only",
+        'btn_video': "🎬 Video",
+        'btn_best': "🏆 Best",
+        'unknown_artist': "Unknown Artist",
+        'unknown_album': "Unknown",
+        'seconds': "s",
+        'minutes': "m",
+        'hours': "h",
+    },
+}
 
-def get_user_quality(chat_id):
-    """Get user quality with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT quality FROM users WHERE chat_id=?", (chat_id,))
-        row = c.fetchone()
-        return row[0] if row and row[0] in ("high", "low") else "high"
+def tr(chat_id: int, key: str, **kwargs) -> str:
+    """Translate a key for a user."""
+    lang = get_user_lang(chat_id) or 'fa'
+    s = LANG_STRINGS.get(lang, LANG_STRINGS['fa']).get(key, key)
+    try:
+        return s.format(**kwargs)
+    except Exception:
+        return s
 
-def set_user_quality(chat_id, q):
-    """Set user quality with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO users (chat_id, lang, quality) VALUES (?, COALESCE((SELECT lang FROM users WHERE chat_id=?),'en'), ?)", (chat_id, chat_id, q))
-        conn.commit()
+# ============================================================
+#  User / stats DB helpers
+# ============================================================
 
-def add_detailed_stats(chat_id, platform, file_type, file_size):
-    """Add detailed statistics to database with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
+def get_user_lang(chat_id: int) -> str:
+    with db_pool.get_conn() as c:
+        r = c.execute("SELECT language FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+        return r['language'] if r else 'fa'
 
-        # Add to detailed stats table
-        c.execute("INSERT INTO detailed_stats (chat_id, platform, file_type, file_size) VALUES (?, ?, ?, ?)", (chat_id, platform, file_type, file_size))
+def set_user_lang(chat_id: int, lang: str):
+    with db_pool.get_conn() as c:
+        c.execute("UPDATE users SET language=? WHERE chat_id=?", (lang, chat_id))
 
-        # Update general stats
-        c.execute("SELECT count, bytes FROM stats WHERE chat_id=?", (chat_id,))
-        row = c.fetchone()
-        if row:
-            c.execute("UPDATE stats SET count=?, bytes=? WHERE chat_id=?", (row[0] + 1, row[1] + file_size, chat_id))
+def get_user_quality(chat_id: int) -> str:
+    with db_pool.get_conn() as c:
+        r = c.execute("SELECT quality FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+        return r['quality'] if r else 'high'
+
+def set_user_quality(chat_id: int, q: str):
+    with db_pool.get_conn() as c:
+        c.execute("UPDATE users SET quality=? WHERE chat_id=?", (q, chat_id))
+
+def ensure_user(chat_id: int, username: str = None, first_name: str = None):
+    with db_pool.get_conn() as c:
+        r = c.execute("SELECT chat_id FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+        if r:
+            if username or first_name:
+                c.execute("UPDATE users SET username=?, first_name=? WHERE chat_id=?",
+                          (username, first_name, chat_id))
         else:
-            c.execute("INSERT INTO stats (chat_id, count, bytes) VALUES (?, ?, ?)", (chat_id, 1, file_size))
+            c.execute("INSERT INTO users(chat_id, username, first_name) VALUES (?,?,?)",
+                      (chat_id, username, first_name))
 
-        # Update global stats
-        c.execute("SELECT count, bytes FROM totals WHERE id=1")
-        t = c.fetchone()
-        c.execute("UPDATE totals SET count=?, bytes=? WHERE id=1", (t[0] + 1, t[1] + file_size))
+def add_detailed_stats(chat_id: int, platform: str, file_type: str, file_size: int):
+    with db_pool.get_conn() as c:
+        c.execute("INSERT INTO stats(chat_id, platform, file_type, file_size) VALUES (?,?,?,?)",
+                  (chat_id, platform, file_type, file_size))
 
-        # Update uptime stats
-        c.execute("UPDATE uptime_stats SET total_downloads = total_downloads + 1 WHERE id=1")
-
-        conn.commit()
-
-def add_stats_with_platform(chat_id, platform, file_type, file_size):
-    """Register stats with platform and file type"""
-    add_detailed_stats(chat_id, platform, file_type, file_size)
-
-# Cache functions for YouTube qualities with connection pooling
-def save_youtube_qualities(chat_id, url, qualities):
-    """Save YouTube qualities for a URL with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO youtube_quality_cache (chat_id, url, qualities) VALUES (?, ?, ?)", 
-                  (chat_id, url, json.dumps(qualities)))
-        conn.commit()
-
-def get_youtube_qualities(chat_id, url):
-    """Get cached YouTube qualities with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT qualities FROM youtube_quality_cache WHERE chat_id=? AND url=?", (chat_id, url))
-        row = c.fetchone()
-        
-        if row:
-            try:
-                return json.loads(row[0])
-            except:
-                return None
-        return None
-
-def clear_youtube_quality_cache(chat_id):
-    """Clear YouTube quality cache for a user with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM youtube_quality_cache WHERE chat_id=?", (chat_id,))
-        conn.commit()
-
-# Cache functions for YouTube Shorts detection with connection pooling
-def save_youtube_shorts_info(chat_id, url, is_short):
-    """Save YouTube Shorts detection info with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO youtube_shorts_cache (chat_id, url, is_short) VALUES (?, ?, ?)", 
-                  (chat_id, url, is_short))
-        conn.commit()
-
-def get_youtube_shorts_info(chat_id, url):
-    """Get cached YouTube Shorts info with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT is_short FROM youtube_shorts_cache WHERE chat_id=? AND url=?", (chat_id, url))
-        row = c.fetchone()
-        
-        if row:
-            return row[0]
-        return None
-
-def clear_youtube_shorts_cache(chat_id):
-    """Clear YouTube Shorts cache for a user with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM youtube_shorts_cache WHERE chat_id=?", (chat_id,))
-        conn.commit()
-
-# ===== Helper Functions =====
-def get_stats(chat_id):
-    """Get user statistics from detailed_stats with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-
-        # User stats from detailed_stats
-        c.execute("SELECT COUNT(*) as count, SUM(file_size) as bytes FROM detailed_stats WHERE chat_id = ?", (chat_id,))
-        user_row = c.fetchone()
-
-        # Global stats from detailed_stats
-        c.execute("SELECT COUNT(*) as count, SUM(file_size) as bytes FROM detailed_stats")
-        global_row = c.fetchone()
-
+def get_stats(chat_id: int) -> Dict:
+    with db_pool.get_conn() as c:
+        total = c.execute("SELECT COUNT(*) as n, COALESCE(SUM(file_size),0) as s FROM stats WHERE chat_id=?",
+                          (chat_id,)).fetchone()
+        by_platform = c.execute(
+            "SELECT platform, COUNT(*) as n, COALESCE(SUM(file_size),0) as s "
+            "FROM stats WHERE chat_id=? GROUP BY platform ORDER BY n DESC", (chat_id,)).fetchall()
         return {
-            "user_count": user_row[0] or 0,
-            "user_bytes": user_row[1] or 0,
-            "total_count": global_row[0] or 0,
-            "total_bytes": global_row[1] or 0
+            'total_count': total['n'],
+            'total_size': total['s'],
+            'by_platform': [dict(r) for r in by_platform],
         }
 
-def get_uptime_stats():
-    """Get bot uptime statistics with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-
-        c.execute("SELECT start_time, total_downloads, total_processed FROM uptime_stats WHERE id=1")
-        row = c.fetchone()
-
-        if row:
-            start_time, total_downloads, total_processed = row
-            # Calculate uptime
-            if start_time:
-                start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-                now = datetime.now()
-                uptime_seconds = (now - start_dt).total_seconds()
-
-                days = int(uptime_seconds // 86400)
-                hours = int((uptime_seconds % 86400) // 3600)
-                minutes = int((uptime_seconds % 3600) // 60)
-
-                uptime_str = f"{days}d {hours}h {minutes}m"
-            else:
-                uptime_str = "Unknown"
-
-            return {
-                "uptime": uptime_str,
-                "total_downloads": total_downloads,
-                "total_processed": total_processed
-            }
-
-        return {"uptime": "Unknown", "total_downloads": 0, "total_processed": 0}
-
-def get_user_display_name(chat_id):
-    """Get user display name (nickname or full name)"""
-    try:
-        user_info = bot.get_chat(chat_id)
-        # Priority to nickname
-        if user_info.username:
-            return f"@{user_info.username}"
-        elif user_info.first_name:
-            if user_info.last_name:
-                return f"{user_info.first_name} {user_info.last_name}"
-            else:
-                return user_info.first_name
-        else:
-            return f"ID:{chat_id}"
-    except:
-        return f"ID:{chat_id}"
-
-def get_user_username(chat_id):
-    """Get pure username (for profile link)"""
-    try:
-        user_info = bot.get_chat(chat_id)
-        return user_info.username
-    except:
-        return None
+def get_uptime_stats() -> Dict:
+    with db_pool.get_conn() as c:
+        total = c.execute("SELECT COUNT(*) as n, COALESCE(SUM(file_size),0) as s FROM stats").fetchone()
+        users = c.execute("SELECT COUNT(*) as n FROM users").fetchone()
+        return {'total_downloads': total['n'], 'total_size': total['s'], 'total_users': users['n']}
 
 def get_top_users_all_time(limit=3):
-    """Get top users of all time with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-
-        c.execute("""
-            SELECT ds.chat_id, COUNT(*) as download_count, SUM(ds.file_size) as total_size
-            FROM detailed_stats ds
-            GROUP BY ds.chat_id
-            ORDER BY download_count DESC
-            LIMIT ?
-        """, (limit,))
-
-        results = []
-        for row in c.fetchall():
-            chat_id, count, size = row
-
-            # Get user display name
-            display_name = get_user_display_name(chat_id)
-
-            # Get most used platform for this user correctly
-            c.execute("""
-                SELECT platform, COUNT(*) as platform_count
-                FROM detailed_stats 
-                WHERE chat_id = ?
-                GROUP BY platform
-                ORDER BY platform_count DESC
-                LIMIT 1
-            """, (chat_id,))
-            platform_row = c.fetchone()
-            
-            if platform_row:
-                most_used_platform = platform_row[0]
-            else:
-                most_used_platform = "Unknown"
-
-            results.append({
-                "chat_id": chat_id,
-                "display_name": display_name,
-                "download_count": count,
-                "total_size": size,
-                "most_used_platform": most_used_platform
-            })
-
-        return results
+    with db_pool.get_conn() as c:
+        rows = c.execute(
+            "SELECT u.chat_id, u.username, u.first_name, COUNT(s.rowid) as n, COALESCE(SUM(s.file_size),0) as s "
+            "FROM users u LEFT JOIN stats s ON u.chat_id=s.chat_id "
+            "GROUP BY u.chat_id ORDER BY n DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
 def get_top_users_daily(limit=3):
-    """Get top daily users with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-
-        c.execute("""
-            SELECT ds.chat_id, COUNT(*) as download_count, SUM(ds.file_size) as total_size
-            FROM detailed_stats ds
-            WHERE DATE(ds.timestamp) = DATE('now')
-            GROUP BY ds.chat_id
-            ORDER BY download_count DESC
-            LIMIT ?
-        """, (limit,))
-
-        results = []
-        for row in c.fetchall():
-            chat_id, count, size = row
-
-            display_name = get_user_display_name(chat_id)
-
-            # Get most used platform for this user correctly
-            c.execute("""
-                SELECT platform, COUNT(*) as platform_count
-                FROM detailed_stats 
-                WHERE chat_id = ? AND DATE(timestamp) = DATE('now')
-                GROUP BY platform
-                ORDER BY platform_count DESC
-                LIMIT 1
-            """, (chat_id,))
-            platform_row = c.fetchone()
-            
-            if platform_row:
-                most_used_platform = platform_row[0]
-            else:
-                most_used_platform = "Unknown"
-
-            results.append({
-                "chat_id": chat_id,
-                "display_name": display_name,
-                "download_count": count,
-                "total_size": size,
-                "most_used_platform": most_used_platform
-            })
-
-        return results
+    cutoff = (datetime.utcnow() - timedelta(days=1)).isoformat()
+    with db_pool.get_conn() as c:
+        rows = c.execute(
+            "SELECT u.chat_id, u.username, u.first_name, COUNT(s.rowid) as n, COALESCE(SUM(s.file_size),0) as s "
+            "FROM users u LEFT JOIN stats s ON u.chat_id=s.chat_id AND s.timestamp>=? "
+            "GROUP BY u.chat_id ORDER BY n DESC LIMIT ?", (cutoff, limit)).fetchall()
+        return [dict(r) for r in rows]
 
 def get_top_users_weekly(limit=3):
-    """Get top weekly users with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-
-        c.execute("""
-            SELECT ds.chat_id, COUNT(*) as download_count, SUM(ds.file_size) as total_size
-            FROM detailed_stats ds
-            WHERE ds.timestamp >= datetime('now', '-7 days')
-            GROUP BY ds.chat_id
-            ORDER BY download_count DESC
-            LIMIT ?
-        """, (limit,))
-
-        results = []
-        for row in c.fetchall():
-            chat_id, count, size = row
-
-            display_name = get_user_display_name(chat_id)
-
-            # Get most used platform for this user correctly
-            c.execute("""
-                SELECT platform, COUNT(*) as platform_count
-                FROM detailed_stats 
-                WHERE chat_id = ? AND timestamp >= datetime('now', '-7 days')
-                GROUP BY platform
-                ORDER BY platform_count DESC
-                LIMIT 1
-            """, (chat_id,))
-            platform_row = c.fetchone()
-            
-            if platform_row:
-                most_used_platform = platform_row[0]
-            else:
-                most_used_platform = "Unknown"
-
-            results.append({
-                "chat_id": chat_id,
-                "display_name": display_name,
-                "download_count": count,
-                "total_size": size,
-                "most_used_platform": most_used_platform
-            })
-
-        return results
+    cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    with db_pool.get_conn() as c:
+        rows = c.execute(
+            "SELECT u.chat_id, u.username, u.first_name, COUNT(s.rowid) as n, COALESCE(SUM(s.file_size),0) as s "
+            "FROM users u LEFT JOIN stats s ON u.chat_id=s.chat_id AND s.timestamp>=? "
+            "GROUP BY u.chat_id ORDER BY n DESC LIMIT ?", (cutoff, limit)).fetchall()
+        return [dict(r) for r in rows]
 
 def get_platform_ranking_all_time():
-    """Platform ranking all time with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-
-        c.execute("SELECT platform, COUNT(*) as download_count, SUM(file_size) as total_size FROM detailed_stats GROUP BY platform ORDER BY download_count DESC")
-
-        results = []
-        for row in c.fetchall():
-            platform, count, size = row
-            results.append({
-                "platform": platform,
-                "download_count": count,
-                "total_size": size
-            })
-
-        return results
+    with db_pool.get_conn() as c:
+        rows = c.execute(
+            "SELECT platform, COUNT(*) as n, COALESCE(SUM(file_size),0) as s "
+            "FROM stats GROUP BY platform ORDER BY n DESC").fetchall()
+        return [dict(r) for r in rows]
 
 def get_platform_ranking_daily():
-    """Daily platform ranking with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-
-        c.execute("SELECT platform, COUNT(*) as download_count, SUM(file_size) as total_size FROM detailed_stats WHERE DATE(timestamp) = DATE('now') GROUP BY platform ORDER BY download_count DESC")
-
-        results = []
-        for row in c.fetchall():
-            platform, count, size = row
-            results.append({
-                "platform": platform,
-                "download_count": count,
-                "total_size": size
-            })
-
-        return results
+    cutoff = (datetime.utcnow() - timedelta(days=1)).isoformat()
+    with db_pool.get_conn() as c:
+        rows = c.execute(
+            "SELECT platform, COUNT(*) as n, COALESCE(SUM(file_size),0) as s "
+            "FROM stats WHERE timestamp>=? GROUP BY platform ORDER BY n DESC", (cutoff,)).fetchall()
+        return [dict(r) for r in rows]
 
 def get_platform_ranking_weekly():
-    """Weekly platform ranking with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-
-        c.execute("SELECT platform, COUNT(*) as download_count, SUM(file_size) as total_size FROM detailed_stats WHERE timestamp >= datetime('now', '-7 days') GROUP BY platform ORDER BY download_count DESC")
-
-        results = []
-        for row in c.fetchall():
-            platform, count, size = row
-            results.append({
-                "platform": platform,
-                "download_count": count,
-                "total_size": size
-            })
-
-        return results
-
-def get_user_platform_stats(chat_id, period='all'):
-    """User platform statistics with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-
-        if period == 'daily':
-            c.execute("SELECT platform, COUNT(*) as download_count, SUM(file_size) as total_size FROM detailed_stats WHERE chat_id = ? AND DATE(timestamp) = DATE('now') GROUP BY platform ORDER BY download_count DESC", (chat_id,))
-        elif period == 'weekly':
-            c.execute("SELECT platform, COUNT(*) as download_count, SUM(file_size) as total_size FROM detailed_stats WHERE chat_id = ? AND timestamp >= datetime('now', '-7 days') GROUP BY platform ORDER BY download_count DESC", (chat_id,))
-        else:  # all time
-            c.execute("SELECT platform, COUNT(*) as download_count, SUM(file_size) as total_size FROM detailed_stats WHERE chat_id = ? GROUP BY platform ORDER BY download_count DESC", (chat_id,))
-
-        results = []
-        for row in c.fetchall():
-            platform, count, size = row
-            results.append({
-                "platform": platform,
-                "download_count": count,
-                "total_size": size
-            })
-
-        return results
-
-def get_user_stats(chat_id, period='all'):
-    """User statistics for specific period with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-
-        if period == 'daily':
-            c.execute("SELECT COUNT(*) as count, SUM(file_size) as bytes FROM detailed_stats WHERE chat_id = ? AND DATE(timestamp) = DATE('now')", (chat_id,))
-        elif period == 'weekly':
-            c.execute("SELECT COUNT(*) as count, SUM(file_size) as bytes FROM detailed_stats WHERE chat_id = ? AND timestamp >= datetime('now', '-7 days')", (chat_id,))
-        else:  # all time
-            c.execute("SELECT COUNT(*) as count, SUM(file_size) as bytes FROM detailed_stats WHERE chat_id = ?", (chat_id,))
-
-        row = c.fetchone()
-        if row:
-            count, bytes = row
-            return {"count": count or 0, "bytes": bytes or 0}
-
-        return {"count": 0, "bytes": 0}
-
-def save_search_choices(chat_id, choices):
-    """Save search choices with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM search_cache WHERE chat_id=?", (chat_id,))
-        for idx, ch in enumerate(choices):
-            c.execute("INSERT INTO search_cache (chat_id, idx, url, title, artist, duration) VALUES (?, ?, ?, ?, ?, ?)", (chat_id, idx, ch["url"], ch["title"], ch["artist"], ch.get("duration", 0)))
-        conn.commit()
-
-def save_playlist_choices(chat_id, choices):
-    """Save playlist songs for selection with connection pooling"""
-    if not choices:
-        return
-
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM playlist_cache WHERE chat_id=?", (chat_id,))
-        for idx, ch in enumerate(choices):
-            title = ch.get("title", "Unknown Title")
-            artist = ch.get("artist", "Unknown Artist")
-            url = ch.get("url", "")
-            duration = ch.get("duration", 0)
-
-            c.execute("INSERT INTO playlist_cache (chat_id, idx, url, title, artist, duration) VALUES (?, ?, ?, ?, ?, ?)", (chat_id, idx, url, title, artist, duration))
-        conn.commit()
-
-def get_search_choice(chat_id, idx):
-    """Get search choice with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT url, title, artist, duration FROM search_cache WHERE chat_id=? AND idx=?", (chat_id, idx))
-        row = c.fetchone()
-        if not row:
-            return None
-        return {"url": row[0], "title": row[1], "artist": row[2], "duration": row[3]}
-
-def get_playlist_choice(chat_id, idx):
-    """Get selected song from playlist with connection pooling"""
-    with db_pool.get_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT url, title, artist, duration FROM playlist_cache WHERE chat_id=? AND idx=?", (chat_id, idx))
-        row = c.fetchone()
-        if not row:
-            return None
-        return {"url": row[0], "title": row[1], "artist": row[2], "duration": row[3]}
-
-# ===== Enhanced FileProcessor Class =====
-class FileProcessor:
-    """Unified file processing for all platforms"""
-    
-    def __init__(self):
-        self.supported_audio_exts = ['.mp3', '.m4a', '.wav', '.ogg', '.opus']
-        self.supported_video_exts = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm']
-        self.supported_image_exts = ['.jpg', '.jpeg', '.png', '.webp']
-    
-    def sanitize_name(self, name: str) -> str:
-        """Sanitize filename for all platforms"""
-        return re.sub(r'[\\/:*?"<>|\n\r]+', ' ', name).strip()
-    
-    def extract_artist(self, info: dict) -> str:
-        """Extract artist info from metadata"""
-        candidates = [
-            info.get("uploader"), info.get("creator"), info.get("artist"),
-            info.get("uploader_id"), info.get("user"), info.get("username"),
-            info.get("channel"), info.get("channel_name"), info.get("author"),
-            info.get("post_author"),
-        ]
-
-        for c in candidates:
-            if c and isinstance(c, str) and c.strip() and c.lower() != "unknown":
-                cleaned = c.strip()
-                if cleaned.endswith(" - topic"):
-                    cleaned = cleaned[:-7].strip()
-                if cleaned and len(cleaned) > 1:
-                    return cleaned
-
-        title = info.get("title") or ""
-        if title and " - " in title:
-            parts = title.split(" - ")
-            if len(parts) >= 2:
-                potential_artist = parts[0].strip()
-                if len(potential_artist) > 1 and len(potential_artist) < 50:
-                    return potential_artist
-
-        url = info.get("webpage_url") or info.get("url") or ""
-        if url:
-            patterns = [r"soundcloud\.com/([^/]+)/", r"/user/([^/]+)/", r"/@([^/]+)/", r"/artist/([^/]+)/"]
-            for pattern in patterns:
-                m = re.search(pattern, url, re.IGNORECASE)
-                if m:
-                    artist_name = m.group(1).strip()
-                    if artist_name and len(artist_name) > 1:
-                        return artist_name
-
-        filename = info.get("_filename") or ""
-        if filename and " - " in filename:
-            parts = filename.split(" - ")
-            if len(parts) >= 2:
-                potential_artist = parts[0].strip()
-                potential_artist = re.sub(r'[\\/:*?"<>|]', '', potential_artist)
-                if potential_artist and len(potential_artist) > 1:
-                    return potential_artist
-
-        return "unknown"
-    
-    def download_thumb(self, thumb_url: str, workdir: str) -> str:
-        """Download thumbnail for all platforms"""
-        try:
-            if not thumb_url:
-                return ""
-            r = requests.get(thumb_url, timeout=10)
-            if r.status_code == 200:
-                path = os.path.join(workdir, "thumb.jpg")
-                with open(path, "wb") as f:
-                    f.write(r.content)
-                return path
-        except Exception:
-            pass
-        return ""
-    
-    def force_audio_extension(self, filepath: str) -> str:
-        """Ensure audio files have .mp3 extension"""
-        base, ext = os.path.splitext(filepath)
-        if ext.lower() in [".ogg", ".opus"]:
-            new_fp = base + ".mp3"
-            try:
-                os.rename(filepath, new_fp)
-                return new_fp
-            except Exception:
-                return filepath
-        return filepath
-    
-    def force_video_extension(self, filepath: str) -> str:
-        """Ensure all video files have .mp4 extension"""
-        base, ext = os.path.splitext(filepath)
-        if ext.lower() not in [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm"]:
-            new_fp = base + ".mp4"
-            try:
-                os.rename(filepath, new_fp)
-                return new_fp
-            except Exception:
-                return filepath
-        elif ext.lower() != ".mp4":
-            new_fp = base + ".mp4"
-            try:
-                os.rename(filepath, new_fp)
-                return new_fp
-            except Exception:
-                return filepath
-        return filepath
-    
-    def find_downloaded_file(self, workdir: str, preferred_exts=None) -> str:
-        """Find the downloaded file in workdir"""
-        if not os.path.exists(workdir):
-            return None
-        
-        existing_files = [f for f in os.listdir(workdir) if os.path.isfile(os.path.join(workdir, f))]
-        
-        if preferred_exts:
-            # Try to find file with preferred extension first
-            for ext in preferred_exts:
-                for file in existing_files:
-                    if file.lower().endswith(ext.lower()):
-                        return os.path.join(workdir, file)
-        
-        # Return any file found
-        if existing_files:
-            return os.path.join(workdir, existing_files[0])
-        
-        return None
-    
-    def process_soundcloud_file(self, info, workdir: str):
-        """Process SoundCloud file with metadata tagging"""
-        fp = info.get("_filename")
-        
-        # If no filename or file doesn't exist, try to find it in workdir
-        if not fp or not os.path.exists(fp):
-            print(f"Original file not found: {fp}")
-            fp = self.find_downloaded_file(workdir, self.supported_audio_exts)
-            print(f"Found file in workdir: {fp}")
-        
-        if not fp or not os.path.exists(fp):
-            return None, "file not found"
-
-        title = self.sanitize_name(info.get("title", "soundcloud_audio"))
-        artist = self.sanitize_name(self.extract_artist(info) or "unknown")
-        ext = os.path.splitext(fp)[1].lstrip(".")
-        new_fp = os.path.join(workdir, f"{artist} - {title}.{ext}")
-        
-        try:
-            os.rename(fp, new_fp)
-            print(f"Renamed file: {fp} -> {new_fp}")
-        except Exception as e:
-            print(f"Rename failed: {e}")
-            new_fp = fp
-        
-        # Apply SoundCloud specific tagging
-        self._tag_audio_file(new_fp, artist, title, info.get("thumbnail"))
-        
-        thumb_file = self.download_thumb(info.get("thumbnail"), workdir)
-        size = os.path.getsize(new_fp)
-        duration = info.get("duration", 0)
-        
-        print(f"Processed SoundCloud file: {new_fp}, size: {size}, duration: {duration}")
-        
-        return {
-            "filepath": new_fp, "title": title, "artist": artist, "size": size,
-            "duration": duration, "thumb_file": thumb_file, "ext": ext.lower(),
-        }, None
-    
-    def process_generic_file(self, info, workdir: str, platform: str = "generic"):
-        """Process generic file for other platforms"""
-        if not info:
-            print("process_generic_file: info is None")
-            return None
-
-        print(f"process_generic_file: info keys = {list(info.keys())}")
-
-        fp = info.get("_filename")
-
-        if not fp:
-            title = info.get("title") or info.get("fulltitle") or "media"
-            title = self.sanitize_name(title)
-
-            # Determine file extension based on platform
-            if platform in ["YouTube", "TikTok", "Instagram", "Twitter"]:
-                ext = ".mp4"  # Default to video for these platforms
-            elif platform == "Pinterest":
-                # Pinterest can be image or video
-                if info.get("ext"):
-                    ext = "." + info["ext"]
-                elif info.get("video_ext"):
-                    ext = "." + info["video_ext"]
-                else:
-                    ext = ".mp4"  # Default to video
-            else:
-                ext = ".mp4"  # Default for unknown platforms
-
-            fp = os.path.join(workdir, f"{title}{ext}")
-            print(f"process_generic_file: Generated filename: {fp}")
-
-            if not os.path.exists(fp):
-                print(f"process_generic_file: File does not exist at {fp}")
-                
-                # Try to find any file in workdir
-                preferred_exts = self.supported_video_exts if platform != "Pinterest" else self.supported_video_exts + self.supported_image_exts
-                fp = self.find_downloaded_file(workdir, preferred_exts)
-                
-                if fp:
-                    print(f"process_generic_file: Found fallback file: {fp}")
-                else:
-                    print("process_generic_file: No files found in workdir")
-                    return None
-
-        # Double-check if file exists before proceeding
-        if not os.path.exists(fp):
-            print(f"process_generic_file: Final file does not exist at {fp}")
-            # Try to find any file in workdir
-            preferred_exts = self.supported_video_exts if platform != "Pinterest" else self.supported_video_exts + self.supported_image_exts
-            fp = self.find_downloaded_file(workdir, preferred_exts)
-            if not fp:
-                print("process_generic_file: No files found in workdir")
-                return None
-            print(f"process_generic_file: Found fallback file: {fp}")
-
-        title = info.get("title") or info.get("fulltitle") or "media"
-        if not title:
-            title = info.get("alt") or info.get("description") or "media"
-        title = self.sanitize_name(title)
-
-        print(f"process_generic_file: title = {title}")
-
-        ext = os.path.splitext(fp)[1].lower()
-        new_fp = os.path.join(workdir, f"{title}{ext}")
-
-        print(f"process_generic_file: old_fp = {fp}")
-        print(f"process_generic_file: new_fp = {new_fp}")
-
-        try:
-            if fp != new_fp:
-                os.rename(fp, new_fp)
-                print("process_generic_file: file renamed successfully")
-        except Exception as e:
-            print(f"process_generic_file: rename failed: {e}")
-            new_fp = fp
-
-        # Ensure video files have .mp4 extension
-        final_fp = new_fp
-        if ext in ['.webm', '.mkv', '.avi', '.mov', '.flv']:
-            final_fp = self.force_video_extension(new_fp)
-            ext = '.mp4'
-
-        # Double-check final file exists
-        if not os.path.exists(final_fp):
-            print(f"process_generic_file: Final file after extension change does not exist at {final_fp}")
-            return None
-
-        size = os.path.getsize(final_fp)
-        duration = int(info.get("duration") or 0)
-        thumb_url = info.get("thumbnail")
-        thumb_file = self.download_thumb(thumb_url, workdir)
-
-        result = {
-            "filepath": final_fp, "title": title, "size": size,
-            "duration": duration, "thumb_file": thumb_file, "ext": ext.lstrip("."),
-        }
-
-        print(f"process_generic_file: result = {result}")
-        return result
-    
-    def _tag_audio_file(self, filepath: str, artist: str, title: str, cover_url: str = None):
-        """Tag audio file with metadata"""
-        try:
-            from mutagen.id3 import ID3, TIT2, TPE1, APIC
-            from mutagen.mp4 import MP4, MP4Cover
-            from mutagen.oggvorbis import OggVorbis
-            ext = os.path.splitext(filepath)[1].lower()
-            if ext == ".mp3":
-                try:
-                    id3 = ID3(filepath)
-                except Exception:
-                    id3 = ID3()
-                id3.add(TIT2(encoding=3, text=title))
-                id3.add(TPE1(encoding=3, text=artist))
-                if cover_url:
-                    try:
-                        img = requests.get(cover_url, timeout=10).content
-                        id3.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=img))
-                    except Exception:
-                        pass
-                id3.save(filepath)
-            elif ext in [".m4a", ".mp4", ".aac"]:
-                audio = MP4(filepath)
-                audio["\xa9nam"] = title
-                audio["\xa9ART"] = artist
-                if cover_url:
-                    try:
-                        img = requests.get(cover_url, timeout=10).content
-                        audio["covr"] = [MP4Cover(img, imageformat=MP4Cover.FORMAT_JPEG)]
-                    except Exception:
-                        pass
-                audio.save()
-            elif ext in [".ogg", ".oga", ".opus"]:
-                audio = OggVorbis(filepath)
-                audio["title"] = [title]
-                audio["artist"] = [artist]
-                audio.save()
-        except Exception:
-            pass
-
-# Initialize global file processor
-file_processor = FileProcessor()
-
-# ===== Enhanced CaptionBuilder Class =====
-class CaptionBuilder:
-    """Unified caption building for all platforms"""
-    
-    def __init__(self):
-        self.platform_emojis = {
-            "SoundCloud": "🎵",
-            "Spotify": "🟢",
-            "YouTube": "🎬",
-            "Pinterest": "📷",
-            "Instagram": "📸",
-            "TikTok": "🎵",
-            "Twitter": "🐦"
-        }
-
-        self.platform_names = {
-            "SoundCloud": "SoundCloud",
-            "Spotify": "Spotify",
-            "YouTube": "YouTube",
-            "Pinterest": "Pinterest",
-            "Instagram": "Instagram",
-            "TikTok": "TikTok",
-            "Twitter": "Twitter"
-        }
-    
-    def format_duration_for_lang(self, seconds: int, lang: str) -> str:
-        """Format duration based on language"""
-        seconds = int(seconds or 0)
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        s = seconds % 60
-        if lang == "fa":
-            return f"{h} ساعت {m} دقیقه {s} ثانیه" if h > 0 else f"{m} دقیقه {s} ثانیه"
-        return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
-    
-    def human_size(self, n: int, chat_id=None) -> str:
-        """Convert bytes to human readable format with Persian/English units"""
-        if chat_id and get_user_lang(chat_id) == "fa":
-            # Persian units
-            for unit in ["بایت", "کیلوبایت", "مگابایت", "گیگابایت"]:
-                if n < 1024.0:
-                    return f"{n:.1f} {unit}"
-                n /= 1024.0
-            return f"{n:.1f} ترابایت"
-        else:
-            # English units
-            for unit in ["B", "KB", "MB", "GB"]:
-                if n < 1024.0:
-                    return f"{n:.1f} {unit}"
-                n /= 1024.0
-            return f"{n:.1f} TB"
-    
-    def build_caption(self, chat_id, platform, item, original_url=None, **kwargs):
-        """Build unified caption for any platform"""
-        lang = get_user_lang(chat_id) or "en"
-        signature = T[lang]["signature"]
-        link_text = tr(chat_id, "content_link")
-        emoji = self.platform_emojis.get(platform, "📁")
-        platform_name = self.platform_names.get(platform, platform)
-        
-        lines = [f"{emoji} {platform_name}"]
-        
-        # Platform-specific formatting
-        if platform == "SoundCloud":
-            lines.extend([
-                f"🎵 {item['artist']} - {item['title']}",
-                f"⏱️ {self.format_duration_for_lang(item['duration'], lang)}",
-                f"💾 {self.human_size(item['size'], chat_id)}"
-            ])
-        elif platform == "Spotify":
-            # Spotify is audio-only; artist + title + album (if any)
-            artist = item.get('artist') or 'Unknown Artist'
-            title = item.get('title') or 'Unknown Track'
-            album = item.get('album')
-            lines.append(f"🎵 {artist} - {title}")
-            if album:
-                lines.append(f"💿 {album}")
-            if item.get("duration"):
-                lines.append(f"⏱️ {self.format_duration_for_lang(item['duration'], lang)}")
-            lines.append(f"💾 {self.human_size(item['size'], chat_id)}")
-        elif platform == "YouTube":
-            audio_only = kwargs.get('audio_only', False)
-            if audio_only:
-                lines.extend([
-                    f"🎵 {item['title']}",
-                    f"⏱️ {self.format_duration_for_lang(item['duration'], lang)}",
-                    f"💾 {self.human_size(item['size'], chat_id)}"
-                ])
-            else:
-                lines.extend([
-                    f"🎬 {item['title']}",
-                    f"⏱️ {self.format_duration_for_lang(item['duration'], lang)}",
-                    f"💾 {self.human_size(item['size'], chat_id)}"
-                ])
-        else:
-            # Generic formatting for other platforms
-            if item.get("title"):
-                lines.append(f"📝 {item['title']}")
-            if item.get("duration"):
-                lines.append(f"⏱️ {self.format_duration_for_lang(item['duration'], lang)}")
-            lines.append(f"💾 {self.human_size(item['size'], chat_id)}")
-        
-        # Add original link if provided
-        if original_url:
-            lines.append(f'🔗 <a href="{original_url}">{link_text}</a>')
-        
-        # Add signature
-        lines.append(f"@{BOT_USERNAME} | {signature}")
-        
-        return "\n".join(lines)
-
-# Initialize global caption builder
-caption_builder = CaptionBuilder()
-
-# ===== Other Helper Functions =====
-def human_size(n: int, chat_id=None) -> str:
-    """Wrapper for backward compatibility"""
-    return caption_builder.human_size(n, chat_id)
-
-def sanitize_name(name: str) -> str:
-    """Wrapper for backward compatibility"""
-    return file_processor.sanitize_name(name)
-
-def extract_artist(info: dict) -> str:
-    """Wrapper for backward compatibility"""
-    return file_processor.extract_artist(info)
-
-def format_duration_for_lang(seconds: int, lang: str) -> str:
-    """Wrapper for backward compatibility"""
-    return caption_builder.format_duration_for_lang(seconds, lang)
-
-def download_thumb(thumb_url: str, workdir: str) -> str:
-    """Wrapper for backward compatibility"""
-    return file_processor.download_thumb(thumb_url, workdir)
-
-def force_audio_extension(filepath: str) -> str:
-    """Wrapper for backward compatibility"""
-    return file_processor.force_audio_extension(filepath)
-
-def force_video_extension(filepath: str) -> str:
-    """Wrapper for backward compatibility"""
-    return file_processor.force_video_extension(filepath)
-
-def process_sc_info_to_file(info, workdir: str):
-    """Wrapper for backward compatibility"""
-    return file_processor.process_soundcloud_file(info, workdir)
-
-def finalize_generic_item(info, workdir: str):
-    """Wrapper for backward compatibility"""
-    return file_processor.process_generic_file(info, workdir)
-
-def detect_platform_from_url(url):
-    """Detect platform from URL"""
-    url = url.lower()
-    if "soundcloud.com" in url:
-        return "SoundCloud"
-    elif "spotify.com" in url or "spoti.fi" in url:
-        return "Spotify"
-    elif "pinterest.com" in url or "pin.it" in url:
-        return "Pinterest"
-    elif "instagram.com" in url or "instagr.am" in url:
-        return "Instagram"
-    elif "youtube.com" in url or "youtu.be" in url:
-        return "YouTube"
-    elif "tiktok.com" in url:
-        return "TikTok"
-    elif "twitter.com" in url or "x.com" in url or "t.co" in url:
-        return "Twitter"
-    else:
-        return "Unknown"
-
-# ===== Safe message editing =====
-_message_cache = {}
-
-def safe_edit_message(text, chat_id, message_id, reply_markup=None):
-    """Safely edit a message, avoiding duplicate edits"""
-    cache_key = (chat_id, message_id)
-    last_text = _message_cache.get(cache_key)
-
-    if last_text == text:
-        return
-
-    try:
-        if reply_markup:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
-        else:
-            bot.edit_message_text(text, chat_id, message_id)
-        _message_cache[cache_key] = text
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "message is not modified" not in error_msg:
-            raise
-        _message_cache[cache_key] = text# Telegram Downloader Bot: Enhanced Version - Part 3
-# Enhanced YouTube Download Logic with Merging, Shorts Detection, and New Button Formatting
-
-# ===== YouTube Detection and Shorts =====
-def is_youtube_short(url: str) -> bool:
-    """Detect if URL is a YouTube Short"""
-    url = url.lower()
-    
-    # Check for shorts indicators in URL
-    if "youtube.com/shorts/" in url:
-        return True
-    elif "youtu.be/" in url:
-        # youtu.be links can be shorts, need to check video info
-        return None  # Unknown, need further checking
-    elif "youtube.com/watch" in url:
-        # Check for shorts parameters
-        if "shorts" in url:
-            return True
-    
-    return False
-
-def get_youtube_video_info(url: str) -> dict:
-    """Get YouTube video information to detect shorts and get details"""
-    tmpdir = tempfile.mkdtemp(prefix="yt_info_")
-    try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": False,
-            "simulate": True,
-            "skip_download": True,
-            "cookies": COOKIES_PATH if COOKIES_AVAILABLE else None,
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info
-    except Exception as e:
-        print(f"Error getting YouTube video info: {e}")
-        return {}
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-def confirm_youtube_short(url: str) -> bool:
-    """Confirm if a YouTube video is actually a Short by checking video info"""
-    info = get_youtube_video_info(url)
-    if not info:
-        return False
-    
-    # Check duration (shorts are typically < 60 seconds)
-    duration = info.get("duration", 0)
-    if duration and duration <= 60:
-        return True
-    
-    # Check for shorts-specific metadata
-    title = info.get("title", "").lower()
-    description = info.get("description", "").lower()
-    
-    # Sometimes shorts have specific indicators
-    if "#shorts" in title or "#shorts" in description:
-        return True
-    
-    return False
-
-# ===== Enhanced YouTube Quality Selection with Merging and New Button Format =====
-def get_youtube_qualities_with_merging(url: str, chat_id):
-    """Get available YouTube qualities with video+audio merging and new button format"""
-    print(f"Getting YouTube qualities for: {url}")
-    tmpdir = tempfile.mkdtemp(prefix="yt_qualities_")
-    try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": False,
-            "simulate": True,
-            "skip_download": True,
-            "listformats": True,
-            "cookies": COOKIES_PATH if COOKIES_AVAILABLE else None,
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                return []
-            
-            formats = info.get("formats", [])
-            qualities = []
-            
-            # Get audio format for merging
-            audio_formats = [f for f in formats if f.get("acodec") != "none" and f.get("vcodec") == "none"]
-            best_audio = None
-            if audio_formats:
-                best_audio = max(audio_formats, key=lambda x: x.get("abr", 0) or 0)
-            
-            # Get video-only formats and merge with audio
-            video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("acodec") == "none"]
-            video_formats.sort(key=lambda x: x.get("height", 0), reverse=True)
-            
-            # Define quality priorities for regular YouTube videos
-            quality_priorities = [1080, 720, 480, 360, 240, 144]
-            
-            for height in quality_priorities:
-                # Find video format with this height
-                video_fmt = None
-                for fmt in video_formats:
-                    if fmt.get("height") == height:
-                        video_fmt = fmt
-                        break
-                
-                if video_fmt and best_audio:
-                    # Create merged format ID
-                    merged_format_id = f"{video_fmt['format_id']}+{best_audio['format_id']}"
-                    
-                    # Calculate actual file size by combining video and audio
-                    video_size = estimate_file_size(video_fmt, info.get("duration", 0))
-                    audio_size = estimate_file_size(best_audio, info.get("duration", 0))
-                    total_size = video_size + audio_size
-                    
-                    if total_size <= TELEGRAM_UPLOAD_LIMIT:
-                        # Quality label based on height
-                        if height >= 1080:
-                            quality_label = "1080p"
-                        elif height >= 720:
-                            quality_label = "720p"
-                        elif height >= 480:
-                            quality_label = "480p"
-                        elif height >= 360:
-                            quality_label = "360p"
-                        else:
-                            quality_label = f"{height}p"
-                        
-                        qualities.append({
-                            "format_id": merged_format_id,
-                            "quality": quality_label,
-                            "size": total_size,
-                            "ext": "mp4",
-                            "type": "video",
-                            "height": height,
-                            "video_format": video_fmt['format_id'],
-                            "audio_format": best_audio['format_id']
-                        })
-            
-            # Add audio-only option
-            if best_audio:
-                audio_size = estimate_file_size(best_audio, info.get("duration", 0))
-                if audio_size <= TELEGRAM_UPLOAD_LIMIT:
-                    qualities.append({
-                        "format_id": best_audio["format_id"],
-                        "quality": "Audio Only",
-                        "size": audio_size,
-                        "ext": best_audio.get("ext", "mp3"),
-                        "type": "audio"
-                    })
-            
-            # Remove duplicates and sort
-            unique_qualities = []
-            seen_qualities = set()
-            for q in qualities:
-                key = (q["quality"], q["type"])
-                if key not in seen_qualities:
-                    unique_qualities.append(q)
-                    seen_qualities.add(key)
-            
-            # Sort: audio first, then video by quality (highest to lowest)
-            unique_qualities.sort(key=lambda x: (x["type"] != "audio", -x.get("height", 0)))
-            
-            print(f"Found {len(unique_qualities)} suitable qualities")
-            for q in unique_qualities:
-                print(f"  - {q['quality']} ({q['type']}): {human_size(q['size'])}")
-            
-            return unique_qualities
-            
-    except Exception as e:
-        print(f"Error getting YouTube qualities: {e}")
-        return []
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-def get_best_youtube_short_quality(url: str, chat_id):
-    """Get best quality for YouTube Shorts (max 1080p, video+audio) under 50MB"""
-    print(f"Getting best YouTube Short quality for: {url}")
-    tmpdir = tempfile.mkdtemp(prefix="yt_shorts_")
-    try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": False,
-            "simulate": True,
-            "skip_download": True,
-            "listformats": True,
-            "cookies": COOKIES_PATH if COOKIES_AVAILABLE else None,
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                return None
-            
-            formats = info.get("formats", [])
-            
-            # Get best audio
-            audio_formats = [f for f in formats if f.get("acodec") != "none"]
-            best_audio = None
-            if audio_formats:
-                best_audio = max(audio_formats, key=lambda x: x.get("abr", 0) or 0)
-            
-            # For Shorts, limit to 1080p maximum
-            max_height = 1080
-            quality_priorities = [1080, 720, 480, 360, 240, 144]
-            
-            # Get best video with audio (prefer pre-merged)
-            video_with_audio = [f for f in formats if f.get("vcodec") != "none" and f.get("acodec") != "none"]
-            video_with_audio.sort(key=lambda x: x.get("height", 0), reverse=True)
-            
-            # Try pre-merged formats first (limited to 1080p)
-            for fmt in video_with_audio:
-                height = fmt.get("height", 0)
-                if height <= max_height:  # Limit to 1080p for Shorts
-                    size = estimate_file_size(fmt, info.get("duration", 0))
-                    if size <= TELEGRAM_UPLOAD_LIMIT:
-                        return {
-                            "format_id": fmt["format_id"],
-                            "quality": f"{height}p",
-                            "size": size,
-                            "ext": fmt.get("ext", "mp4"),
-                            "type": "video"
-                        }
-            
-            # If no suitable pre-merged format, try to merge video-only + audio (limited to 1080p)
-            if best_audio:
-                video_only = [f for f in formats if f.get("vcodec") != "none" and f.get("acodec") == "none"]
-                video_only.sort(key=lambda x: x.get("height", 0), reverse=True)
-                
-                for video_fmt in video_only:
-                    height = video_fmt.get("height", 0)
-                    if height <= max_height:  # Limit to 1080p for Shorts
-                        merged_format_id = f"{video_fmt['format_id']}+{best_audio['format_id']}"
-                        video_size = estimate_file_size(video_fmt, info.get("duration", 0))
-                        audio_size = estimate_file_size(best_audio, info.get("duration", 0))
-                        total_size = video_size + audio_size
-                        
-                        if total_size <= TELEGRAM_UPLOAD_LIMIT:
-                            return {
-                                "format_id": merged_format_id,
-                                "quality": f"{height}p",
-                                "size": total_size,
-                                "ext": "mp4",
-                                "type": "video",
-                                "video_format": video_fmt['format_id'],
-                                "audio_format": best_audio['format_id']
-                            }
-            
-            # Fallback to audio only
-            if best_audio:
-                audio_size = estimate_file_size(best_audio, info.get("duration", 0))
-                if audio_size <= TELEGRAM_UPLOAD_LIMIT:
-                    return {
-                        "format_id": best_audio["format_id"],
-                        "quality": "Audio Only",
-                        "size": audio_size,
-                        "ext": best_audio.get("ext", "mp3"),
-                        "type": "audio"
-                    }
-            
-            return None
-            
-    except Exception as e:
-        print(f"Error getting YouTube Short quality: {e}")
-        return None
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-# ===== Enhanced Button Formatting =====
-def create_youtube_quality_keyboard(qualities, chat_id):
-    """Create keyboard for YouTube quality selection with new glass-style button format"""
-    lang = get_user_lang(chat_id) or "en"
-    kb = InlineKeyboardMarkup()
-    
-    if not qualities:
-        return kb
-    
-    for i, quality in enumerate(qualities):
-        # Safe access to type field with fallback
-        quality_type = quality.get("type", "video")
-        
-        if quality_type == "audio":
-            # Audio only button with new format
-            if lang == "fa":
-                label = "فقط صدا"
-            else:
-                label = "Audio Only"
-            
-            size_mb = quality["size"] / (1024 * 1024)
-            size_text = f"{size_mb:.1f} مگابایت" if lang == "fa" else f"{size_mb:.1f} MB"
-            
-            full_label = f"🎵 {label} • {size_text}"
-        else:
-            # Video button with new format
-            quality_label = quality.get("quality", "Unknown")
-            size_mb = quality["size"] / (1024 * 1024)
-            size_text = f"{size_mb:.1f} مگابایت" if lang == "fa" else f"{size_mb:.1f} MB"
-            
-            full_label = f"🎬 {quality_label} • {size_text}"
-        
-        format_id = quality.get("format_id", "unknown")
-        callback_data = f"yt_quality:{format_id}:{quality_type}"
-        
-        # Create button with proper formatting
-        if i % 2 == 0:
-            # First button in row
-            current_row = [InlineKeyboardButton(text=full_label, callback_data=callback_data)]
-        else:
-            # Second button in row - add the row
-            current_row.append(InlineKeyboardButton(text=full_label, callback_data=callback_data))
-            kb.row(*current_row)
-            current_row = []
-    
-    # Add the last row if it has only one button
-    if 'current_row' in locals() and len(current_row) == 1:
-        kb.row(*current_row)
-    
-    return kb
-
-def create_youtube_shorts_keyboard(chat_id):
-    """Create keyboard for YouTube Shorts selection with new glass-style format"""
-    lang = get_user_lang(chat_id) or "en"
-    kb = InlineKeyboardMarkup()
-    
-    # For Shorts, we'll use the same format but with simpler options
-    if lang == "fa":
-        video_btn = "🎬 ویدیو"
-        audio_btn = "🎵 فقط صدا"
-    else:
-        video_btn = "🎬 Video"
-        audio_btn = "🎵 Audio Only"
-    
-    kb.row(
-        InlineKeyboardButton(text=video_btn, callback_data="yt_shorts:video"),
-        InlineKeyboardButton(text=audio_btn, callback_data="yt_shorts:audio")
-    )
-    
-    return kb
-
-# ===== YouTube Quality Selection Handler =====
-def handle_youtube_quality_selection(call):
-    """Handle YouTube quality selection callback with merging support"""
-    chat_id = call.message.chat.id
-    message_id = call.message.message_id
-    
-    try:
-        # Parse callback data
-        parts = call.data.split(":")
-        if len(parts) < 3:
-            bot.answer_callback_query(call.id, "Invalid selection")
-            return
-        
-        format_id = parts[1]
-        media_type = parts[2]  # "audio" or "video"
-        
-        # Get the URL and qualities from cache
-        with db_pool.get_connection() as conn:
-            c = conn.cursor()
-            c.execute("SELECT url FROM youtube_quality_cache WHERE chat_id=?", (chat_id,))
-            row = c.fetchone()
-        
-        if not row:
-            bot.answer_callback_query(call.id, "URL not found")
-            return
-        
-        url = row[0]
-        
-        # Get the quality text for display
-        quality_text = "Audio Only" if media_type == "audio" else "Video"
-        
-        # For video, try to get the actual quality from the format_id
-        if media_type == "video":
-            # Extract quality from format_id if it's a merged format
-            if "+" in format_id:
-                # This is a merged format, we need to get the quality from our cached data
-                qualities = get_youtube_qualities(chat_id, url)
-                if qualities:
-                    for q in qualities:
-                        if q.get("format_id") == format_id:
-                            quality_text = f"Video ({q.get('quality', 'Unknown')})"
-                            break
-                else:
-                    # Fallback: try to extract from format_id (less reliable)
-                    quality_text = f"Video ({format_id})"
-            else:
-                quality_text = f"Video ({format_id})"
-        else:
-            # For Persian users, show "فقط صدا"
-            if get_user_lang(chat_id) == "fa":
-                quality_text = "فقط صدا"
-            else:
-                quality_text = "Audio Only"
-        
-        # Answer callback immediately to avoid timeout
-        bot.answer_callback_query(call.id, tr(chat_id, "youtube_selected_quality", quality=quality_text))
-        
-        # Delete the quality selection message
-        try:
-            bot.delete_message(chat_id, message_id)
-        except Exception as e:
-            print(f"Error deleting quality selection message: {e}")
-        
-        # Show downloading message with correct quality text
-        msg = bot.send_message(chat_id, tr(chat_id, "youtube_downloading", quality=quality_text))
-        
-        # Download with selected quality
-        download_youtube_with_quality(chat_id, url, format_id, media_type, msg.message_id)
-        
-    except Exception as e:
-        print(f"Error in YouTube quality selection: {e}")
-        # Only answer callback if not already answered
-        try:
-            bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
-        except:
-            pass
-
-def handle_youtube_shorts_selection(call):
-    """Handle YouTube Shorts selection callback with new logic"""
-    chat_id = call.message.chat.id
-    message_id = call.message.message_id
-    
-    try:
-        # Parse callback data
-        parts = call.data.split(":")
-        if len(parts) < 2:
-            bot.answer_callback_query(call.id, "Invalid selection")
-            return
-        
-        choice = parts[1]  # "video" or "audio"
-        
-        # Get the URL from cache
-        with db_pool.get_connection() as conn:
-            c = conn.cursor()
-            c.execute("SELECT url FROM youtube_shorts_cache WHERE chat_id=?", (chat_id,))
-            row = c.fetchone()
-        
-        if not row:
-            bot.answer_callback_query(call.id, "URL not found")
-            return
-        
-        url = row[0]
-        
-        # Delete the selection message
-        try:
-            bot.delete_message(chat_id, message_id)
-        except Exception as e:
-            print(f"Error deleting selection message: {e}")
-        
-        # Get best quality for the short to show actual quality
-        quality_info = get_best_youtube_short_quality(url, chat_id)
-        
-        # Get the quality text for display
-        if choice == "audio":
-            # For Persian users, show "فقط صدا"
-            if get_user_lang(chat_id) == "fa":
-                choice_text = "فقط صدا"
-            else:
-                choice_text = "Audio Only"
-        else:
-            # For video, show the actual quality
-            if quality_info:
-                choice_text = f"Video ({quality_info.get('quality', 'Unknown')})"
-            else:
-                choice_text = "Video"
-        
-        # Answer callback immediately to avoid timeout
-        bot.answer_callback_query(call.id, f"Downloading {choice_text}")
-        
-        # Delete the selection message
-        try:
-            bot.delete_message(chat_id, message_id)
-        except Exception as e:
-            print(f"Error deleting selection message: {e}")
-        
-        msg = bot.send_message(chat_id, tr(chat_id, "youtube_shorts_downloading"))
-        
-        # Download the short with best quality
-        download_youtube_short_with_choice(chat_id, url, choice, msg.message_id)
-        
-    except Exception as e:
-        print(f"Error in YouTube Shorts selection: {e}")
-        # Only answer callback if not already answered
-        try:
-            bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
-        except:
-            pass
-
-def download_youtube_with_quality(chat_id, url, format_id, media_type, message_id):
-    """Download YouTube with specific quality with merging support"""
-    tmpdir = tempfile.mkdtemp(prefix="youtube_dl_")
-    
-    try:
-        # Create progress bar instance
-        progress_bar = ProgressBar(chat_id, message_id)
-        
-        def progress_hook(d):
-            try:
-                if d.get("status") == "downloading":
-                    done = d.get("downloaded_bytes", 0)
-                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                    progress_bar.update(done, total)
-            except Exception:
-                pass
-        
-        # Download with selected format
-        audio_only = (media_type == "audio")
-        ydl_opts = make_youtube_opts(tmpdir, format_id, progress_hook=progress_hook, audio_only=audio_only)
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            info["_filename"] = ydl.prepare_filename(info)
-            item = finalize_generic_item(info, tmpdir)
-            
-            if item:
-                # Ensure correct file extension
-                if not audio_only:
-                    item["filepath"] = force_video_extension(item["filepath"])
-                
-                # Send the file
-                send_youtube_item(chat_id, item, url, audio_only)
-            else:
-                safe_edit_message(tr(chat_id, "error", err="Failed to process downloaded file"), chat_id, message_id)
-                
-    except Exception as e:
-        safe_edit_message(tr(chat_id, "error", err=str(e)), chat_id, message_id)
-    finally:
-        # Clean up AFTER sending
-        if tmpdir and os.path.exists(tmpdir):
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        
-        # Clear cache
-        clear_youtube_quality_cache(chat_id)
-
-def download_youtube_short_with_choice(chat_id, url, choice, message_id):
-    """Download YouTube Short with user choice and no thumbnail"""
-    tmpdir = tempfile.mkdtemp(prefix="youtube_short_dl_")
-    
-    try:
-        # Create progress bar instance
-        progress_bar = ProgressBar(chat_id, message_id)
-        
-        def progress_hook(d):
-            try:
-                if d.get("status") == "downloading":
-                    done = d.get("downloaded_bytes", 0)
-                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                    progress_bar.update(done, total)
-            except Exception:
-                pass
-        
-        # Get best quality for the short (max 1080p)
-        quality_info = get_best_youtube_short_quality(url, chat_id)
-        
-        if not quality_info:
-            safe_edit_message(tr(chat_id, "error", err="No suitable quality found"), chat_id, message_id)
-            return
-        
-        # Determine format based on user choice
-        if choice == "audio":
-            # Force audio-only
-            format_id = None  # Will use best audio
-            audio_only = True
-            quality_text = "فقط صدا" if get_user_lang(chat_id) == "fa" else "Audio Only"
-        else:
-            # Use best video quality found (max 1080p)
-            format_id = quality_info["format_id"]
-            audio_only = False
-            quality_text = quality_info.get('quality', 'Video')
-        
-        # Update downloading message with actual quality
-        safe_edit_message(tr(chat_id, "youtube_downloading", quality=quality_text), chat_id, message_id)
-        
-        # Download
-        ydl_opts = make_youtube_opts(tmpdir, format_id, progress_hook=progress_hook, audio_only=audio_only)
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            info["_filename"] = ydl.prepare_filename(info)
-            item = finalize_generic_item(info, tmpdir)
-            
-            if item:
-                # Ensure correct file extension
-                if not audio_only:
-                    item["filepath"] = force_video_extension(item["filepath"])
-                
-                # Send the file WITHOUT thumbnail for Shorts
-                send_youtube_short_item(chat_id, item, url, audio_only)
-            else:
-                safe_edit_message(tr(chat_id, "error", err="Failed to process downloaded file"), chat_id, message_id)
-                
-    except Exception as e:
-        safe_edit_message(tr(chat_id, "error", err=str(e)), chat_id, message_id)
-    finally:
-        # Clean up AFTER sending
-        if tmpdir and os.path.exists(tmpdir):
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        
-        # Clear cache
-        clear_youtube_shorts_cache(chat_id)
-
-# ===== Enhanced yt-dlp options builders =====
-def make_sc_opts(workdir: str, quality: str, progress_hook=None, force_mp3=False, proxy_url=None):
-    format_sel = "bestaudio/best" if quality == "high" else "bestaudio[abr<=128]/bestaudio/best"
-    opts = {
-        "format": format_sel,
-        "noplaylist": False,
-        "outtmpl": os.path.join(workdir, "%(title)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "default_search": "auto",
-        "socket_timeout": 60,
-        "extractor_retries": 5,
-        "fragment_retries": 5,
-        "retry_sleep": 2,
-        "file_access_retries": 3,
-        "retries": 5,
-    }
-    
-    # Add proxy if provided with better configuration
-    if proxy_url:
-        opts["proxy"] = proxy_url
-        # Additional options for better proxy compatibility
-        if proxy_url.startswith('http://'):
-            opts["http_proxy"] = proxy_url
-            opts["https_proxy"] = proxy_url
-        elif proxy_url.startswith('socks5://'):
-            opts["socks_proxy"] = proxy_url
-        
-    if progress_hook:
-        opts["progress_hooks"] = [progress_hook]
-    if force_mp3:
-        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
-    return opts
-
-def make_generic_opts(workdir: str, progress_hook=None, proxy_url=None):
-    opts = {
-        "format": "bestvideo+bestaudio/bestvideo/bestaudio/best",
-        "outtmpl": os.path.join(workdir, "%(title)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "nocheckcertificate": True,
-        "no_check_certificate": True,
-        "extractor_retries": 5,
-        "socket_timeout": 30,
-        "prefer_ffmpeg": True,
-        "ignoreerrors": True,
-    }
-    
-    if COOKIES_AVAILABLE:
-        opts["extractor_args"] = {
-            "instagram": {
-                "cookies": [COOKIES_PATH]
+    cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    with db_pool.get_conn() as c:
+        rows = c.execute(
+            "SELECT platform, COUNT(*) as n, COALESCE(SUM(file_size),0) as s "
+            "FROM stats WHERE timestamp>=? GROUP BY platform ORDER BY n DESC", (cutoff,)).fetchall()
+        return [dict(r) for r in rows]
+
+def get_user_platform_stats(chat_id: int, period='all'):
+    sql = "SELECT platform, COUNT(*) as n, COALESCE(SUM(file_size),0) as s FROM stats WHERE chat_id=?"
+    params = [chat_id]
+    if period == 'daily':
+        sql += " AND timestamp>=?"
+        params.append((datetime.utcnow() - timedelta(days=1)).isoformat())
+    elif period == 'weekly':
+        sql += " AND timestamp>=?"
+        params.append((datetime.utcnow() - timedelta(days=7)).isoformat())
+    sql += " GROUP BY platform ORDER BY n DESC"
+    with db_pool.get_conn() as c:
+        return [dict(r) for r in c.execute(sql, params).fetchall()]
+
+# ---- Spotify cache ----
+def save_spotify_cache(chat_id: int, url: str, content_type: str, tracks: list, meta: dict = None):
+    with db_pool.get_conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO spotify_cache(chat_id, url, content_type, tracks_json, meta_json) "
+            "VALUES (?,?,?,?,?)",
+            (chat_id, url, content_type, json.dumps(tracks, ensure_ascii=False), json.dumps(meta or {}, ensure_ascii=False)))
+
+def get_spotify_cache(chat_id: int, url: str):
+    with db_pool.get_conn() as c:
+        r = c.execute("SELECT * FROM spotify_cache WHERE chat_id=? AND url=?",
+                      (chat_id, url)).fetchone()
+        if r:
+            return {
+                'content_type': r['content_type'],
+                'tracks': json.loads(r['tracks_json']),
+                'meta': json.loads(r['meta_json']),
             }
-        }
-        opts["cookiefile"] = COOKIES_PATH
-
-    if proxy_url:
-        opts["proxy"] = proxy_url
-
-    if progress_hook:
-        opts["progress_hooks"] = [progress_hook]
-    return opts
-
-def make_youtube_opts(workdir: str, format_id: str, progress_hook=None, proxy_url=None, audio_only=False):
-    """YouTube-specific options with quality selection and cookie support"""
-    if audio_only:
-        opts = {
-            "format": "bestaudio[ext=m4a]/",
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio", 
-                    "preferredcodec": "m4a",  # از m4a استفاده کنید (سریع‌تر از mp3)
-                    "preferredquality": "192"  # یا حذف کنید برای کیفیت اصلی
-                }
-            ],
-        }
-    else:
-        opts = {
-            "format": format_id,
-            "outtmpl": os.path.join(workdir, "%(title)s.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "nocheckcertificate": True,
-            "socket_timeout": 30,
-            "extractor_retries": 3,
-            "fragment_retries": 3,
-            "retry_sleep": 2,
-            "prefer_ffmpeg": True,
-        }
-    
-    # Add cookies if available
-    if COOKIES_AVAILABLE:
-        opts["cookies"] = COOKIES_PATH
-        print(f"Using cookies file: {COOKIES_PATH}")
-    else:
-        print("No cookies file available, proceeding without cookies")
-    
-    if proxy_url:
-        opts["proxy"] = proxy_url
-    if progress_hook:
-        opts["progress_hooks"] = [progress_hook]
-    return opts
-
-# ===== SoundCloud core =====
-def detect_content_type(url):
-    """Smart content type detection from link"""
-    url = resolve_url(url)
-
-    if 'soundcloud.com' in url:
-        if any(indicator in url.lower() for indicator in ['/sets/', '/albums/', '/playlist/']):
-            return "playlist"
-        if any(pattern in url for pattern in ['/you/', '/stations/']):
-            return "playlist"
-
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (compatible; SoundCloudBot/1.0)'}
-        response = requests.head(url, headers=headers, allow_redirects=True, timeout=10)
-        content_type = response.headers.get('content-type', '')
-        final_url = response.url
-
-        if any(indicator in final_url.lower() for indicator in ['/sets/', '/albums/', '/playlist/']):
-            return "playlist"
-        if any(pattern in final_url for pattern in ['/you/', '/stations/']):
-            return "playlist"
-
-    except Exception as e:
-        print(f"Error in URL detection: {e}")
-
-    try:
-        ydl_opts = {
-            "quiet": True, "no_warnings": True, "extract_flat": False,
-            "simulate": True, "skip_download": True,
-            "cookies": COOKIES_PATH if COOKIES_AVAILABLE else None,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-            if "entries" in info and info["entries"]:
-                if len(info["entries"]) > 1:
-                    return "playlist"
-                elif len(info["entries"]) == 1:
-                    return "single"
-
-            if info.get("_type") == "playlist":
-                return "playlist"
-            elif info.get("ie_key") == "soundcloud:set":
-                return "playlist"
-            elif info.get("ie_key") == "soundcloud:track":
-                return "single"
-
-    except Exception as e:
-        print(f"Error in yt-dlp detection: {e}")
-
-    return "single"
-
-def download_soundcloud_with_retry(url_or_query: str, workdir: str, quality: str, is_search=False, search_limit=15, progress_hook=None, max_retries=15):
-    """Download SoundCloud content with proxy retry logic"""
-    
-    for attempt in range(max_retries):
-        proxy_url = None
-        
-        # Use proxy for SoundCloud if enabled
-        if ENABLE_PROXY_FOR_SOUNDCLOUD and not is_search:
-            if attempt == 0:
-                # First attempt without proxy
-                proxy_url = None
-            else:
-                # Subsequent attempts with proxy
-                if ENABLE_PROXY_ROTATION:
-                    proxy_url = proxy_manager.get_working_proxy()
-                
-                if not proxy_url:
-                    print("No working proxy available, trying without proxy")
-                    proxy_url = None
-                else:
-                    print(f"Attempt {attempt + 1}: Using proxy {proxy_url}")
-                    
-                    # Try alternative proxy format if HTTP fails multiple times
-                    if attempt > 5 and proxy_url.startswith('http://'):
-                        alt_proxy = proxy_manager.get_alternative_proxy_format(proxy_url)
-                        if alt_proxy != proxy_url:
-                            print(f"Trying alternative format: {alt_proxy}")
-                            proxy_url = alt_proxy
-        
-        try:
-            ydl_opts = make_sc_opts(workdir, quality, progress_hook=progress_hook, force_mp3=FORCE_MP3, proxy_url=proxy_url)
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                if is_search:
-                    info = ydl.extract_info(f"scsearch{search_limit}:{url_or_query}", download=False)
-                    entries = info.get("entries") or []
-                    choices = []
-                    for e in entries:
-                        choices.append({
-                            "title": e.get("title"), "artist": extract_artist(e),
-                            "url": e.get("webpage_url"), "duration": e.get("duration", 0),
-                            "thumb": e.get("thumbnail"),
-                        })
-                    return {"choices": choices, "ok": True}
-                else:
-                    content_type = detect_content_type(url_or_query)
-                    print(f"Detected content type: {content_type} for URL: {url_or_query}")
-
-                    if content_type == "playlist":
-                        ydl_opts_playlist = {
-                            "quiet": True, "no_warnings": True, "extract_flat": False,
-                            "simulate": True, "skip_download": True,
-                        }
-                        
-                        # Add proxy to playlist detection if available
-                        if proxy_url:
-                            ydl_opts_playlist["proxy"] = proxy_url
-
-                        with yt_dlp.YoutubeDL(ydl_opts_playlist) as ydl_playlist:
-                            info = ydl_playlist.extract_info(url_or_query, download=False)
-
-                            if "entries" in info and info["entries"]:
-                                playlist_items = []
-                                for e in info["entries"]:
-                                    if e:
-                                        playlist_items.append({
-                                            "title": e.get("title", "Unknown Title"),
-                                            "artist": extract_artist(e) or "Unknown Artist",
-                                            "url": e.get("webpage_url", ""),
-                                            "duration": e.get("duration", 0),
-                                            "thumb": e.get("thumbnail"),
-                                        })
-
-                                return {"playlist": playlist_items, "ok": True, "content_type": "playlist"}
-                            else:
-                                return {"error": "No playlist items found", "ok": False}
-                    else:
-                        info = ydl.extract_info(url_or_query, download=True)
-                        info["_filename"] = ydl.prepare_filename(info)
-                        item, err = process_sc_info_to_file(info, workdir)
-                        if not item:
-                            return {"error": err or "failed", "ok": False}
-                        return {"item": item, "ok": True, "content_type": "single"}
-                        
-        except Exception as e:
-            error_str = str(e).lower()
-            print(f"Attempt {attempt + 1} failed: {error_str}")
-            
-            # Check if it's a geo-restriction error
-            if "geo restriction" in error_str or "not available from your location" in error_str:
-                if attempt < max_retries - 1:
-                    print("Geo-restriction detected, will retry with proxy")
-                    continue
-            
-            # If it's last attempt, return error
-            if attempt == max_retries - 1:
-                return {"error": str(e), "ok": False}
-            
-            # Continue to next attempt
-            continue
-    
-    return {"error": "All attempts failed", "ok": False}
-
-def download_soundcloud(url_or_query: str, workdir: str, quality: str, is_search=False, search_limit=15, progress_hook=None):
-    """Wrapper for backward compatibility"""
-    return download_soundcloud_with_retry(url_or_query, workdir, quality, is_search, search_limit, progress_hook)
-
-# ============================================================
-# ===== Spotify Support (NEW) =====
-# ============================================================
-# Spotify doesn't allow direct audio streaming, so we:
-#   1. Parse the Spotify link (track / album / playlist / artist)
-#   2. For each track, build a search query: "artist - title"
-#   3. Search & download the matching audio from YouTube via yt-dlp
-#   4. Tag the file with Spotify metadata (artist, title, album, cover)
-#
-# We use spotapi (public, NO API keys, NO login) for rich metadata;
-# it simulates browser requests to Spotify's public web API.
-# If spotapi is unavailable we fall back to the public oEmbed endpoint.
-# ============================================================
-
-# Spotify URL patterns
-SPOTIFY_TRACK_RE = re.compile(r'spotify\.com/track/([a-zA-Z0-9]+)', re.IGNORECASE)
-SPOTIFY_ALBUM_RE = re.compile(r'spotify\.com/album/([a-zA-Z0-9]+)', re.IGNORECASE)
-SPOTIFY_PLAYLIST_RE = re.compile(r'spotify\.com/playlist/([a-zA-Z0-9]+)', re.IGNORECASE)
-SPOTIFY_ARTIST_RE = re.compile(r'spotify\.com/artist/([a-zA-Z0-9]+)', re.IGNORECASE)
-
-
-def detect_spotify_content_type(url):
-    """Return ('track'|'album'|'playlist'|'artist'|None, spotify_id)."""
-    m = SPOTIFY_TRACK_RE.search(url)
-    if m:
-        return "track", m.group(1)
-    m = SPOTIFY_ALBUM_RE.search(url)
-    if m:
-        return "album", m.group(1)
-    m = SPOTIFY_PLAYLIST_RE.search(url)
-    if m:
-        return "playlist", m.group(1)
-    m = SPOTIFY_ARTIST_RE.search(url)
-    if m:
-        return "artist", m.group(1)
-    return None, None
-
-
-def _format_duration_ms(ms):
-    """Convert Spotify duration_ms (int milliseconds) to seconds (int)."""
-    try:
-        return int(int(ms) / 1000)
-    except Exception:
-        return 0
-
-
-def _spotify_oembed(url):
-    """Public oEmbed fallback - works without credentials, returns limited metadata.
-    Used only when spotapi is unavailable or fails."""
-    try:
-        r = requests.get(
-            "https://open.spotify.com/oembed",
-            params={"url": url, "format": "json"},
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        if r.status_code == 200:
-            return r.json()
-    except Exception as e:
-        print(f"Spotify oEmbed failed: {e}")
     return None
 
+def clear_spotify_cache(chat_id: int):
+    with db_pool.get_conn() as c:
+        c.execute("DELETE FROM spotify_cache WHERE chat_id=?", (chat_id,))
 
-def _best_spotify_image(sources):
-    """Pick the largest image URL from a Spotify 'sources' list.
-    Spotify returns sources sorted small -> large; we pick the largest by height."""
+# ---- YouTube caches ----
+def save_youtube_qualities(chat_id: int, url: str, qualities: list):
+    with db_pool.get_conn() as c:
+        c.execute("INSERT OR REPLACE INTO youtube_quality_cache(chat_id, url, qualities_json) VALUES (?,?,?)",
+                  (chat_id, url, json.dumps(qualities)))
+
+def get_youtube_qualities(chat_id: int, url: str):
+    with db_pool.get_conn() as c:
+        r = c.execute("SELECT qualities_json FROM youtube_quality_cache WHERE chat_id=? AND url=?",
+                      (chat_id, url)).fetchone()
+        return json.loads(r['qualities_json']) if r else None
+
+def save_youtube_shorts_info(chat_id: int, url: str, is_short: bool):
+    with db_pool.get_conn() as c:
+        c.execute("INSERT OR REPLACE INTO youtube_shorts_cache(chat_id, url, is_short) VALUES (?,?,?)",
+                  (chat_id, url, 1 if is_short else 0))
+
+def get_youtube_shorts_info(chat_id: int, url: str):
+    with db_pool.get_conn() as c:
+        r = c.execute("SELECT is_short FROM youtube_shorts_cache WHERE chat_id=? AND url=?",
+                      (chat_id, url)).fetchone()
+        return bool(r['is_short']) if r else None
+
+# ---- Search choices ----
+def save_search_choices(chat_id: int, choices: list):
+    with db_pool.get_conn() as c:
+        c.execute("DELETE FROM search_choices WHERE chat_id=?", (chat_id,))
+        for idx, ch in enumerate(choices):
+            c.execute("INSERT OR REPLACE INTO search_choices(chat_id, idx, choice_json) VALUES (?,?,?)",
+                      (chat_id, idx, json.dumps(ch, ensure_ascii=False)))
+
+def get_search_choice(chat_id: int, idx: int):
+    with db_pool.get_conn() as c:
+        r = c.execute("SELECT choice_json FROM search_choices WHERE chat_id=? AND idx=?",
+                      (chat_id, idx)).fetchone()
+        return json.loads(r['choice_json']) if r else None
+
+def save_playlist_choices(chat_id: int, choices: list):
+    with db_pool.get_conn() as c:
+        c.execute("DELETE FROM playlist_choices WHERE chat_id=?", (chat_id,))
+        for idx, ch in enumerate(choices):
+            c.execute("INSERT OR REPLACE INTO playlist_choices(chat_id, idx, choice_json) VALUES (?,?,?)",
+                      (chat_id, idx, json.dumps(ch, ensure_ascii=False)))
+
+def get_playlist_choice(chat_id: int, idx: int):
+    with db_pool.get_conn() as c:
+        r = c.execute("SELECT choice_json FROM playlist_choices WHERE chat_id=? AND idx=?",
+                      (chat_id, idx)).fetchone()
+        return json.loads(r['choice_json']) if r else None
+
+# ============================================================
+#  Proxy Manager
+# ============================================================
+
+class ProxyManager:
+    def __init__(self, proxies: List[str]):
+        self.proxies = list(proxies)
+        self._idx = 0
+        self._lock = threading.Lock()
+        self._bad: set = set()
+
+    def next(self) -> Optional[str]:
+        if not self.proxies:
+            return None
+        with self._lock:
+            attempts = 0
+            while attempts < len(self.proxies):
+                p = self.proxies[self._idx % len(self.proxies)]
+                self._idx += 1
+                attempts += 1
+                if p not in self._bad:
+                    return p
+            return None
+
+    def mark_bad(self, proxy: str):
+        with self._lock:
+            self._bad.add(proxy)
+            log.info(f"Proxy marked bad: {proxy} (bad={len(self._bad)}/{len(self.proxies)})")
+
+    def reset_bad(self):
+        with self._lock:
+            self._bad.clear()
+
+proxy_mgr = ProxyManager(MANUAL_PROXIES)
+
+# ============================================================
+#  Utility helpers
+# ============================================================
+
+def human_size(n: int, chat_id: int = None) -> str:
+    """Human-readable file size."""
+    if not n:
+        return "0 B"
+    units = ['B', 'KB', 'MB', 'GB', 'TB']
+    i = int(math.floor(math.log(n, 1024)))
+    if i >= len(units):
+        i = len(units) - 1
+    s = n / (1024 ** i)
+    if i == 0:
+        return f"{n} B"
+    return f"{s:.1f} {units[i]}"
+
+def sanitize_name(name: str, max_len: int = 80) -> str:
+    if not name:
+        return "audio"
+    # Remove characters that are invalid in filenames
+    name = re.sub(r'[\\/:*?"<>|\n\r\t]', ' ', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    if len(name) > max_len:
+        name = name[:max_len].rsplit(' ', 1)[0]
+    return name or "audio"
+
+def format_duration(seconds: int, lang: str = 'fa') -> str:
+    if not seconds or seconds < 0:
+        return "0:00"
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+def format_duration_ms(ms: int, lang: str = 'fa') -> str:
+    if not ms:
+        return "0:00"
+    return format_duration(ms / 1000, lang)
+
+def detect_platform_from_url(url: str) -> str:
+    u = (url or '').lower()
+    if 'spotify.com' in u or 'spoti.fi/' in u:
+        return 'spotify'
+    if 'soundcloud.com' in u or 'on.soundcloud.com' in u:
+        return 'soundcloud'
+    if 'youtube.com' in u or 'youtu.be' in u:
+        return 'youtube'
+    if 'pinterest.' in u or 'pin.it' in u:
+        return 'pinterest'
+    if 'instagram.com' in u:
+        return 'instagram'
+    if 'tiktok.com' in u:
+        return 'tiktok'
+    if 'twitter.com' in u or 'x.com' in u or 't.co' in u:
+        return 'twitter'
+    return 'unknown'
+
+def deep_get(obj, *keys, default=None):
+    """Safely traverse nested dicts/lists."""
+    cur = obj
+    for k in keys:
+        if cur is None:
+            return default
+        if isinstance(cur, dict):
+            cur = cur.get(k)
+        elif isinstance(cur, list):
+            try:
+                cur = cur[k]
+            except (IndexError, TypeError):
+                return default
+        else:
+            return default
+    return cur if cur is not None else default
+
+def best_image_from_sources(sources: list) -> Optional[str]:
+    """Pick the highest-resolution image URL from a list of source dicts."""
     if not sources:
         return None
-    best_url = None
-    best_h = -1
+    best = None
+    best_area = -1
     for s in sources:
         if not isinstance(s, dict):
             continue
-        h = s.get("height") or 0
-        if h and h > best_h:
-            best_h = h
-            best_url = s.get("url")
-    return best_url or (sources[0].get("url") if isinstance(sources[0], dict) else None)
+        url = s.get('url')
+        if not url:
+            continue
+        w = s.get('width', 0) or 0
+        h = s.get('height', 0) or 0
+        area = w * h
+        if area > best_area:
+            best_area = area
+            best = url
+    if not best:
+        for s in sources:
+            if isinstance(s, dict) and s.get('url'):
+                return s['url']
+    return best
 
+def upgrade_soundcloud_thumb(url: str) -> str:
+    """SoundCloud: replace t500x500 with 'original' for HD cover."""
+    if not url:
+        return url
+    # Replace -t500x500, -t300x300, -large, -t67x67 etc. with -original
+    return re.sub(r'-t\d+x\d+\.(jpg|jpeg|png|webp)', r'-original.\1', url, flags=re.IGNORECASE)
 
-def _uri_to_url(uri):
-    """Convert a 'spotify:track:ID' URI to an https open.spotify.com URL."""
+def upgrade_youtube_thumb(url: str) -> str:
+    """YouTube: use maxresdefault if available."""
+    if not url:
+        return url
+    # Replace hqdefault/mqdefault/sddefault with maxresdefault
+    return re.sub(r'(hq|mq|sd)default\.(jpg|webp)', r'maxresdefault.\2', url, flags=re.IGNORECASE)
+
+async def is_member(chat_id: int) -> bool:
+    """Check if user is member of the required channel."""
+    if not CHANNEL_USERNAME:
+        return True
+    try:
+        ch = CHANNEL_USERNAME.lstrip('@')
+        member = await bot.get_chat_member(f"@{ch}", chat_id)
+        return member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
+                                  ChatMemberStatus.CREATOR, ChatMemberStatus.OWNER)
+    except Exception as e:
+        log.warning(f"is_member check failed: {e}")
+        # If we can't check (e.g. bot not admin), allow the user
+        return True
+
+# ============================================================
+#  Async wrappers for sync operations
+# ============================================================
+
+async def run_sync(func, *args, **kwargs):
+    """Run a sync function in a thread."""
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+# ============================================================
+#  Progress Bar (async)
+# ============================================================
+
+class ProgressBar:
+    """Live progress bar for Telegram messages. Async-safe."""
+    def __init__(self, bot: Bot, chat_id: int, message_id: int, total: int = 0,
+                 title: str = "", lang: str = 'fa', unit: str = 'B'):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.total = total
+        self.title = title
+        self.lang = lang
+        self.unit = unit
+        self.downloaded = 0
+        self.start_time = time.time()
+        self.last_update = 0
+        self.last_percent = -1
+        self._lock = asyncio.Lock()
+        self._closed = False
+        self._bar_chars = 10  # number of blocks in the bar
+
+    def _build_text(self, percent: int, speed: float = 0) -> str:
+        filled = int(self._bar_chars * percent / 100)
+        bar = '█' * filled + '░' * (self._bar_chars - filled)
+        size_str = ""
+        if self.total and self.unit == 'B':
+            size_str = f"  {human_size(self.downloaded)} / {human_size(self.total)}"
+        elif self.unit == 'B':
+            size_str = f"  {human_size(self.downloaded)}"
+        speed_str = ""
+        if speed > 0:
+            speed_str = f"  ⚡ {human_size(int(speed))}/s"
+        eta_str = ""
+        if self.total and speed > 0 and percent < 100:
+            remaining = (self.total - self.downloaded) / speed
+            if remaining < 3600:
+                eta_str = f"  ⏳ {int(remaining//60)}:{int(remaining%60):02d}"
+        return (f"{self.title}\n\n"
+                f"<code>{bar}</code>  <b>{percent}%</b>{size_str}{speed_str}{eta_str}")
+
+    async def update(self, downloaded: int, total: int = None):
+        if self._closed:
+            return
+        async with self._lock:
+            now = time.time()
+            if total:
+                self.total = total
+            self.downloaded = downloaded
+            if not self.total:
+                # No total — update every 1 second based on downloaded
+                if now - self.last_update < 1:
+                    return
+                self.last_update = now
+                elapsed = now - self.start_time
+                speed = downloaded / elapsed if elapsed > 0 else 0
+                text = self._build_text(0, speed).replace('  <b>0%</b>', '')
+                text = f"{self.title}\n\n📦 {human_size(downloaded)}  ⚡ {human_size(int(speed))}/s"
+                try:
+                    await self.bot.edit_message_text(text, chat_id=self.chat_id, message_id=self.message_id)
+                except (TelegramBadRequest, TelegramRetryAfter):
+                    pass
+                return
+            percent = int(downloaded * 100 / self.total) if self.total else 0
+            percent = min(100, max(0, percent))
+            # Throttle: update every 1.2s or every 5% change
+            if now - self.last_update < 1.2 and abs(percent - self.last_percent) < 5:
+                return
+            self.last_update = now
+            self.last_percent = percent
+            elapsed = now - self.start_time
+            speed = downloaded / elapsed if elapsed > 0 else 0
+            text = self._build_text(percent, speed)
+            try:
+                await self.bot.edit_message_text(text, chat_id=self.chat_id, message_id=self.message_id)
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+            except TelegramBadRequest:
+                pass
+
+    def make_ytdlp_hook(self):
+        """Return a yt-dlp progress_hooks callback that updates this bar."""
+        def hook(d):
+            if d.get('status') == 'downloading':
+                downloaded = d.get('downloaded_bytes', 0) or 0
+                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                # Schedule async update
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    return
+                if loop.is_running():
+                    asyncio.run_coroutine_threadsafe(self.update(downloaded, total), loop)
+            elif d.get('status') == 'finished':
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    return
+                if loop.is_running():
+                    asyncio.run_coroutine_threadsafe(self.update(self.total or 0, self.total), loop)
+        return hook
+
+    async def close(self, final_text: str = None):
+        async with self._lock:
+            self._closed = True
+            if final_text:
+                try:
+                    await self.bot.edit_message_text(final_text, chat_id=self.chat_id, message_id=self.message_id)
+                except (TelegramBadRequest, TelegramRetryAfter):
+                    pass
+
+# ============================================================
+#  Coloured Button Builder
+# ============================================================
+#  Telegram doesn't natively support coloured buttons, so we emulate
+#  ButtonStyle.DANGER / SUCCESS / PRIMARY / WARNING with vivid emoji
+#  prefixes that make each button's intent visually obvious.
+# ============================================================
+
+class ButtonStyle:
+    """Emulated button styles (via emoji prefixes since Telegram has no native colour)."""
+    DANGER = "🔴"      # red — delete / cancel / stop
+    SUCCESS = "🟢"     # green — download / confirm / success
+    PRIMARY = "🔵"     # blue — main action / navigate
+    WARNING = "🟡"     # yellow — caution / settings
+    INFO = "🟣"        # purple — info / help
+    NEUTRAL = "⚪"     # grey — neutral
+
+def styled_button(text: str, style: str = ButtonStyle.PRIMARY, callback_data: str = None,
+                  url: str = None) -> InlineKeyboardButton:
+    """Build an inline button with a coloured-emoji prefix."""
+    full = f"{style} {text}" if not text.startswith(('🔴','🟢','🔵','🟡','🟣','⚪','🚫','✅','❌','⬅️','➡️','✖️','🔙','🔍','📥','🎵','🎬','📊','🌐','❓','🏠')) else text
+    if url:
+        return InlineKeyboardButton(text=full, url=url)
+    return InlineKeyboardButton(text=full, callback_data=callback_data or "noop")
+
+def add_styled(builder: InlineKeyboardBuilder, text: str, callback_data: str,
+               style: str = ButtonStyle.PRIMARY, col: int = 1):
+    """Add a styled button to a builder."""
+    builder.add(styled_button(text, style=style, callback_data=callback_data))
+
+# ============================================================
+#  Caption Builder
+# ============================================================
+
+class CaptionBuilder:
+    def __init__(self, chat_id: int):
+        self.chat_id = chat_id
+        self.lang = get_user_lang(chat_id)
+        self.lines: List[str] = []
+
+    def add_title(self, title: str):
+        if title:
+            self.lines.append(f"🎵 <b>{title}</b>")
+
+    def add_artist(self, artist: str):
+        if artist and artist != tr(self.chat_id, 'unknown_artist'):
+            self.lines.append(f"🎤 {artist}")
+
+    def add_album(self, album: str):
+        if album and album != tr(self.chat_id, 'unknown_album'):
+            self.lines.append(f"💿 {album}")
+
+    def add_duration(self, seconds: int):
+        if seconds:
+            self.lines.append(f"⏱️ {format_duration(seconds, self.lang)}")
+
+    def add_bitrate(self, br: int):
+        if br:
+            self.lines.append(f"🎧 {br}kbps")
+
+    def add_quality(self, q: str):
+        if q:
+            self.lines.append(f"🏆 {q}")
+
+    def add_size(self, size: int):
+        if size:
+            self.lines.append(f"💾 {human_size(size)}")
+
+    def add_platform(self, platform: str):
+        platform_names = {
+            'spotify': '🎧 Spotify', 'soundcloud': '☁️ SoundCloud',
+            'youtube': '📺 YouTube', 'pinterest': '📌 Pinterest',
+            'instagram': '📸 Instagram', 'tiktok': '🎵 TikTok',
+            'twitter': '🐦 Twitter/X',
+        }
+        name = platform_names.get(platform, platform)
+        self.lines.append(f"📲 {name}")
+
+    def add_separator(self):
+        self.lines.append("━" * 18)
+
+    def add_footer(self, username: str = None):
+        self.add_separator()
+        if username:
+            self.lines.append(f"👤 @{username}")
+        self.lines.append(f"🤖 @{BOT_USERNAME}")
+
+    def build(self) -> str:
+        return "\n".join(self.lines)
+
+# ============================================================
+#  File processor
+# ============================================================
+
+def force_audio_extension(filepath: str) -> str:
+    base, _ = os.path.splitext(filepath)
+    new = base + '.mp3'
+    if filepath != new:
+        try:
+            os.rename(filepath, new)
+        except OSError:
+            pass
+        return new
+    return filepath
+
+def force_video_extension(filepath: str) -> str:
+    base, _ = os.path.splitext(filepath)
+    new = base + '.mp4'
+    if filepath != new:
+        try:
+            os.rename(filepath, new)
+        except OSError:
+            pass
+        return new
+    return filepath
+
+def get_actual_file_size(filepath: str) -> int:
+    """Get the actual file size on disk (post-conversion)."""
+    try:
+        return os.path.getsize(filepath)
+    except OSError:
+        return 0
+
+def embed_mp3_metadata(filepath: str, title: str = None, artist: str = None,
+                       album: str = None, cover_url: str = None, track_num: int = None,
+                       year: str = None):
+    """Embed ID3 tags + cover art into an MP3 file using mutagen."""
+    if not MUTAGEN_AVAILABLE:
+        return False
+    try:
+        audio = MP3(filepath, ID3=ID3)
+        try:
+            audio.add_tags()
+        except Exception:
+            pass
+        tags = audio.tags
+        if title:
+            tags.add(TIT2(encoding=3, text=title))
+        if artist:
+            tags.add(TPE1(encoding=3, text=artist))
+        if album:
+            tags.add(TALB(encoding=3, text=album))
+        if track_num:
+            tags.add(TRCK(encoding=3, text=str(track_num)))
+        if year:
+            tags.add(TYER(encoding=3, text=str(year)))
+        if cover_url:
+            try:
+                resp = requests.get(cover_url, timeout=15)
+                if resp.status_code == 200 and resp.content:
+                    tags.add(APIC(
+                        encoding=3, mime='image/jpeg', type=3,
+                        desc='Cover', data=resp.content
+                    ))
+            except Exception as e:
+                log.warning(f"Cover download failed: {e}")
+        audio.save()
+        return True
+    except Exception as e:
+        log.warning(f"MP3 tag embedding failed: {e}")
+        return False
+
+def embed_mp4_metadata(filepath: str, title: str = None, artist: str = None,
+                       album: str = None, cover_url: str = None):
+    """Embed metadata into an M4A/MP4 file using mutagen."""
+    if not MUTAGEN_AVAILABLE:
+        return False
+    try:
+        audio = MP4(filepath)
+        try:
+            audio.add_tags()
+        except Exception:
+            pass
+        tags = audio.tags
+        if title:
+            tags['\xa9nam'] = [title]
+        if artist:
+            tags['\xa9ART'] = [artist]
+        if album:
+            tags['\xa9alb'] = [album]
+        if cover_url:
+            try:
+                resp = requests.get(cover_url, timeout=15)
+                if resp.status_code == 200 and resp.content:
+                    tags['covr'] = [MP4Cover(resp.content, imageformat=MP4Cover.FORMAT_JPEG)]
+            except Exception as e:
+                log.warning(f"Cover download failed: {e}")
+        audio.save()
+        return True
+    except Exception as e:
+        log.warning(f"MP4 tag embedding failed: {e}")
+        return False
+
+def embed_flac_metadata(filepath: str, title: str = None, artist: str = None,
+                        album: str = None, cover_url: str = None):
+    """Embed metadata into a FLAC file."""
+    if not MUTAGEN_AVAILABLE:
+        return False
+    try:
+        audio = FLAC(filepath)
+        if title:
+            audio['title'] = title
+        if artist:
+            audio['artist'] = artist
+        if album:
+            audio['album'] = album
+        if cover_url:
+            try:
+                resp = requests.get(cover_url, timeout=15)
+                if resp.status_code == 200 and resp.content:
+                    pic = mutagen.flac.Picture()
+                    pic.type = 3
+                    pic.mime = 'image/jpeg'
+                    pic.desc = 'Cover'
+                    pic.data = resp.content
+                    audio.add_picture(pic)
+            except Exception as e:
+                log.warning(f"Cover download failed: {e}")
+        audio.save()
+        return True
+    except Exception as e:
+        log.warning(f"FLAC tag embedding failed: {e}")
+        return False
+
+def embed_audio_metadata(filepath: str, **kwargs):
+    """Auto-detect file type and embed metadata."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == '.mp3':
+        return embed_mp3_metadata(filepath, **kwargs)
+    elif ext in ('.m4a', '.mp4', '.aac'):
+        return embed_mp4_metadata(filepath, **kwargs)
+    elif ext == '.flac':
+        return embed_flac_metadata(filepath, **kwargs)
+    return False
+
+def download_thumb_hd(thumb_url: str, workdir: str) -> Optional[str]:
+    """Download a thumbnail (upgraded to HD if possible) and return its path."""
+    if not thumb_url:
+        return None
+    # Upgrade URL for HD
+    url = thumb_url
+    if 'sndcdn.com' in url:
+        url = upgrade_soundcloud_thumb(url)
+    elif 'ytimg.com' in url:
+        url = upgrade_youtube_thumb(url)
+    # Download
+    try:
+        resp = requests.get(url, timeout=20)
+        if resp.status_code != 200 or not resp.content:
+            # Fallback to original URL
+            resp = requests.get(thumb_url, timeout=20)
+            if resp.status_code != 200 or not resp.content:
+                return None
+        # Save
+        ext = '.jpg'
+        if 'png' in resp.headers.get('Content-Type', '').lower():
+            ext = '.png'
+        elif 'webp' in resp.headers.get('Content-Type', '').lower():
+            ext = '.webp'
+        path = os.path.join(workdir, f"cover_{int(time.time()*1000)}{ext}")
+        with open(path, 'wb') as f:
+            f.write(resp.content)
+        return path
+    except Exception as e:
+        log.warning(f"Thumbnail download failed: {e}")
+        # Try original URL as last resort
+        try:
+            resp = requests.get(thumb_url, timeout=15)
+            if resp.status_code == 200 and resp.content:
+                ext = '.jpg'
+                path = os.path.join(workdir, f"cover_{int(time.time()*1000)}{ext}")
+                with open(path, 'wb') as f:
+                    f.write(resp.content)
+                return path
+        except Exception:
+            pass
+        return None
+
+def download_cover_bytes(url: str) -> Optional[bytes]:
+    """Download a cover image and return its bytes (for sending as photo)."""
+    if not url:
+        return None
+    # Upgrade to HD
+    if 'sndcdn.com' in url:
+        url = upgrade_soundcloud_thumb(url)
+    try:
+        resp = requests.get(url, timeout=20)
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+    except Exception:
+        pass
+    # Fallback to original URL
+    try:
+        if 'sndcdn.com' in url:
+            # Try without 'original' suffix
+            fallback = re.sub(r'-original\.(jpg|jpeg|png|webp)', r'-t500x500.\1', url)
+            resp = requests.get(fallback, timeout=15)
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+    except Exception:
+        pass
+    return None
+
+def ensure_jpeg_bytes(data: bytes) -> bytes:
+    """Convert any image bytes to JPEG (Telegram photo API needs JPEG/PNG)."""
+    try:
+        img = Image.open(BytesIO(data))
+        if img.mode in ('RGBA', 'P'):
+            img = img.convert('RGB')
+        out = BytesIO()
+        img.save(out, format='JPEG', quality=95)
+        return out.getvalue()
+    except Exception:
+        return data
+
+# ============================================================
+#  Spotify — using spotapi (NO API keys, NO login required)
+# ============================================================
+#  spotapi data structure (verified):
+#    Public.song_info(id) -> {'data': {'trackUnion': {...}}}
+#      trackUnion.name, .firstArtist.items[0].profile.name,
+#      .albumOfTrack.name, .albumOfTrack.coverArt.sources[],
+#      .duration.totalMilliseconds, .uri
+#
+#    PublicAlbum(id).get_album_info() -> {'data': {'albumUnion': {...}}}
+#      albumUnion.name, .artists.items[0].profile.name,
+#      .coverArt.sources[], .date.year, .tracksV2.totalCount
+#
+#    PublicAlbum(id).paginate_album() -> yields LIST of {track: {...}, uid}
+#      track.name, .uri, .duration.totalMilliseconds, .artists.items[0].profile.name
+#
+#    PublicPlaylist(id).get_playlist_info() -> {'data': {'playlistV2': {...}}}
+#      playlistV2.name, .ownerV2.data.name, .images.items[0].sources[],
+#      .content.totalCount
+#
+#    PublicPlaylist(id).paginate_playlist() -> yields DICT {items: [...]}
+#      each item.itemV2.data has .name, .uri, .trackDuration.totalMilliseconds,
+#      .artists.items[0].profile.name, .albumOfTrack.name, .albumOfTrack.coverArt.sources[]
+# ============================================================
+
+SPOTIFY_PATTERNS = {
+    'track': re.compile(r'spotify\.com/track/([a-zA-Z0-9]+)'),
+    'album': re.compile(r'spotify\.com/album/([a-zA-Z0-9]+)'),
+    'playlist': re.compile(r'spotify\.com/playlist/([a-zA-Z0-9]+)'),
+    'artist': re.compile(r'spotify\.com/artist/([a-zA-Z0-9]+)'),
+    'show': re.compile(r'spotify\.com/show/([a-zA-Z0-9]+)'),
+    'episode': re.compile(r'spotify\.com/episode/([a-zA-Z0-9]+)'),
+}
+
+def detect_spotify_content_type(url: str) -> Optional[str]:
+    """Detect Spotify content type from URL. Handles ?si= and other query params."""
+    for ptype, pat in SPOTIFY_PATTERNS.items():
+        if pat.search(url):
+            return ptype
+    return None
+
+def _spotify_id_from_url(url: str, ptype: str) -> Optional[str]:
+    m = SPOTIFY_PATTERNS[ptype].search(url)
+    return m.group(1) if m else None
+
+def _uri_to_url(uri: str) -> str:
+    """Convert spotify:track:ID to https URL."""
     if not uri:
         return ""
-    m = re.match(r'spotify:track:([a-zA-Z0-9]+)', uri)
-    if m:
-        return f"https://open.spotify.com/track/{m.group(1)}"
-    return ""
+    parts = uri.split(':')
+    if len(parts) == 3 and parts[0] == 'spotify':
+        return f"https://open.spotify.com/{parts[1]}/{parts[2]}"
+    return uri
 
-
-# ---------------------------------------------------------------------------
-#  spotapi-based parsers (NO API keys, NO login - public web API only)
-# ---------------------------------------------------------------------------
-
-def _parse_spotify_track_spotapi(spotify_id):
-    """Parse a single Spotify track using spotapi.Public.song_info()."""
+def _parse_spotify_track_spotapi(spotify_id: str) -> Optional[dict]:
+    """Parse a single Spotify track via spotapi (returns dict)."""
     if not SPOTAPI_AVAILABLE:
         return None
     try:
-        raw = SpotapiPublic.song_info(spotify_id)
-        t = (raw.get("data", {}) or {}).get("trackUnion", {}) or {}
-        if not t:
+        data = SpotapiPublic.song_info(spotify_id)
+        tu = deep_get(data, 'data', 'trackUnion', default={})
+        if not tu:
             return None
-        artist = ""
-        fa_items = (t.get("firstArtist", {}) or {}).get("items", []) or []
-        if fa_items:
-            artist = (fa_items[0].get("profile", {}) or {}).get("name", "") or ""
-        album_obj = t.get("albumOfTrack", {}) or {}
-        cover = _best_spotify_image(album_obj.get("coverArt", {}).get("sources", []))
-        uri = t.get("uri", "") or ""
+        # Artist: try firstArtist first, then otherArtists, then albumOfTrack.artists
+        artist = None
+        artist = (deep_get(tu, 'firstArtist', 'items', 0, 'profile', 'name')
+                  or deep_get(tu, 'otherArtists', 'items', 0, 'profile', 'name')
+                  or deep_get(tu, 'albumOfTrack', 'artists', 'items', 0, 'profile', 'name'))
+        # Cover
+        cover = best_image_from_sources(deep_get(tu, 'albumOfTrack', 'coverArt', 'sources', default=[]))
         return {
-            "title": t.get("name", "Unknown Track") or "Unknown Track",
-            "artist": artist or "Unknown Artist",
-            "album": album_obj.get("name", "") or "",
-            "duration": _format_duration_ms((t.get("duration", {}) or {}).get("totalMilliseconds", 0)),
-            "thumb": cover,
-            "url": _uri_to_url(uri),
-            "uri": uri,
+            'name': tu.get('name'),
+            'artist': artist,
+            'album': deep_get(tu, 'albumOfTrack', 'name'),
+            'duration_ms': deep_get(tu, 'duration', 'totalMilliseconds'),
+            'cover': cover,
+            'uri': tu.get('uri'),
+            'url': _uri_to_url(tu.get('uri', '')),
+            'album_uri': deep_get(tu, 'albumOfTrack', 'uri'),
+            'year': deep_get(tu, 'albumOfTrack', 'date', 'year'),
         }
     except Exception as e:
-        print(f"spotapi track parse failed: {e}")
+        log.warning(f"spotapi track parse failed for {spotify_id}: {e}")
         return None
 
+def _spotify_oembed(track_url: str) -> Optional[dict]:
+    """Fallback: public oEmbed endpoint (only works for tracks)."""
+    try:
+        r = requests.get(f"https://open.spotify.com/oembed?url={track_url}", timeout=15)
+        if r.status_code == 200:
+            d = r.json()
+            return {
+                'name': d.get('title'),
+                'artist': d.get('provider_name'),
+                'album': None,
+                'duration_ms': None,
+                'cover': d.get('thumbnail_url'),
+                'uri': None,
+                'url': track_url,
+            }
+    except Exception as e:
+        log.warning(f"oEmbed failed: {e}")
+    return None
 
-def _parse_spotify_track_public(track_url):
-    """Parse a single Spotify track using oEmbed (fallback only)."""
-    data = _spotify_oembed(track_url)
-    if not data:
+def _parse_spotify_album(spotify_id: str) -> Optional[dict]:
+    """Parse a Spotify album via spotapi."""
+    if not SPOTAPI_AVAILABLE:
         return None
-    raw_title = data.get("title", "Unknown Track")
-    artist = "Unknown Artist"
-    title = raw_title
-    if " - " in raw_title:
-        parts = raw_title.split(" - ", 1)
-        artist = parts[0].strip()
-        title = parts[1].strip()
-    return {
-        "title": title,
-        "artist": artist,
-        "album": data.get("album_name") or title,
-        "duration": 0,
-        "thumb": data.get("thumbnail_url"),
-        "url": track_url,
-        "uri": "",
-    }
-
-
-def _parse_spotify_album(spotify_id):
-    """Parse a Spotify album into a list of tracks using spotapi (no credentials)."""
-    tracks = []
-    meta = {}
-
-    if SPOTAPI_AVAILABLE:
-        # --- 1. Album metadata via get_album_info() ---
+    try:
+        a = SpotapiPublicAlbum(spotify_id)
+        data = a.get_album_info()
+        au = deep_get(data, 'data', 'albumUnion', default={})
+        if not au:
+            return None
+        artist = deep_get(au, 'artists', 'items', 0, 'profile', 'name')
+        cover = best_image_from_sources(deep_get(au, 'coverArt', 'sources', default=[]))
+        year = deep_get(au, 'date', 'year')
+        total = deep_get(au, 'tracksV2', 'totalCount')
+        tracks = []
         try:
-            album = SpotapiPublicAlbum(spotify_id)
-            info = album.get_album_info(limit=1, offset=0) or {}
-            au = (info.get("data", {}) or {}).get("albumUnion", {}) or {}
-            art_items = (au.get("artists", {}) or {}).get("items", []) or []
-            artist_name = "Unknown Artist"
-            if art_items:
-                artist_name = (art_items[0].get("profile", {}) or {}).get("name", "") or "Unknown Artist"
-            meta = {
-                "name": au.get("name", "Unknown Album") or "Unknown Album",
-                "artist": artist_name,
-                "year": str((au.get("date") or {}).get("year", "") or ""),
-                "total": (au.get("tracksV2", {}) or {}).get("totalCount", 0) or 0,
-                "thumb": _best_spotify_image((au.get("coverArt", {}) or {}).get("sources", [])),
-            }
+            for page in a.paginate_album():
+                if isinstance(page, list):
+                    for item in page:
+                        t = item.get('track', {}) if isinstance(item, dict) else {}
+                        if not t:
+                            continue
+                        t_artist = (deep_get(t, 'artists', 'items', 0, 'profile', 'name')
+                                    or artist)
+                        tracks.append({
+                            'name': t.get('name'),
+                            'uri': t.get('uri'),
+                            'url': _uri_to_url(t.get('uri', '')),
+                            'duration_ms': deep_get(t, 'duration', 'totalMilliseconds'),
+                            'artist': t_artist,
+                            'album': au.get('name'),
+                            'cover': cover,
+                            'year': year,
+                            'track_number': t.get('trackNumber'),
+                        })
         except Exception as e:
-            print(f"spotapi album meta failed: {e}")
-            meta = {"name": "Unknown Album", "artist": "Unknown Artist", "year": "", "total": 0, "thumb": None}
-
-        # --- 2. Full track list via paginate_album() ---
-        try:
-            for chunk in album.paginate_album():
-                if not isinstance(chunk, list):
-                    continue
-                for item in chunk:
-                    if not isinstance(item, dict):
-                        continue
-                    t = item.get("track", {}) or {}
-                    if not t:
-                        continue
-                    art_items = (t.get("artists", {}) or {}).get("items", []) or []
-                    a_name = (art_items[0].get("profile", {}) or {}).get("name", meta["artist"]) if art_items else meta["artist"]
-                    uri = t.get("uri", "") or ""
-                    tracks.append({
-                        "title": t.get("name", "Unknown Track") or "Unknown Track",
-                        "artist": a_name,
-                        "album": meta["name"],
-                        "duration": _format_duration_ms((t.get("duration", {}) or {}).get("totalMilliseconds", 0)),
-                        "thumb": meta["thumb"],
-                        "url": _uri_to_url(uri),
-                        "uri": uri,
-                    })
-        except Exception as e:
-            print(f"spotapi album tracks failed: {e}")
-
-    # --- Fallback: oEmbed (album-level info only, no track list) ---
-    if not tracks:
-        album_url = f"https://open.spotify.com/album/{spotify_id}"
-        data = _spotify_oembed(album_url)
-        if data:
-            meta = {
-                "name": data.get("title", "Unknown Album"),
-                "artist": "Unknown Artist",
-                "year": "",
-                "total": 0,
-                "thumb": data.get("thumbnail_url"),
-            }
-    return tracks, meta
-
-
-def _parse_spotify_playlist(spotify_id):
-    """Parse a Spotify playlist into a list of tracks using spotapi (no credentials)."""
-    tracks = []
-    meta = {}
-
-    if SPOTAPI_AVAILABLE:
-        # --- 1. Playlist metadata via get_playlist_info() ---
-        try:
-            pl = SpotapiPublicPlaylist(spotify_id)
-            info = pl.get_playlist_info(limit=1, offset=0) or {}
-            pu = (info.get("data", {}) or {}).get("playlistV2", {}) or {}
-            owner = (pu.get("ownerV2", {}) or {}).get("data", {}) or {}
-            meta = {
-                "name": pu.get("name", "Unknown Playlist") or "Unknown Playlist",
-                "owner": owner.get("name", "Unknown") or "Unknown",
-                "total": (pu.get("content", {}) or {}).get("totalCount", 0) or 0,
-                "thumb": None,
-            }
-            imgs = (pu.get("images", {}) or {}).get("items", []) or []
-            if imgs:
-                meta["thumb"] = _best_spotify_image((imgs[0].get("sources", []) or []))
-        except Exception as e:
-            print(f"spotapi playlist meta failed: {e}")
-            meta = {"name": "Unknown Playlist", "owner": "Unknown", "total": 0, "thumb": None}
-
-        # --- 2. Full track list via paginate_playlist() ---
-        try:
-            for chunk in pl.paginate_playlist():
-                items = (chunk.get("items", []) if isinstance(chunk, dict) else []) or []
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    t = (item.get("itemV2", {}) or {}).get("data", {}) or {}
-                    if not t or t.get("__typename") != "Track":
-                        continue
-                    art_items = (t.get("artists", {}) or {}).get("items", []) or []
-                    a_name = (art_items[0].get("profile", {}) or {}).get("name", "Unknown Artist") if art_items else "Unknown Artist"
-                    album_obj = t.get("albumOfTrack", {}) or {}
-                    cover = _best_spotify_image((album_obj.get("coverArt", {}) or {}).get("sources", []))
-                    uri = t.get("uri", "") or ""
-                    # duration can be under 'trackDuration' or 'duration' depending on context
-                    dur_ms = ((t.get("trackDuration", {}) or {}).get("totalMilliseconds", 0)
-                              or (t.get("duration", {}) or {}).get("totalMilliseconds", 0))
-                    tracks.append({
-                        "title": t.get("name", "Unknown Track") or "Unknown Track",
-                        "artist": a_name,
-                        "album": album_obj.get("name", "") or "",
-                        "duration": _format_duration_ms(dur_ms),
-                        "thumb": cover,
-                        "url": _uri_to_url(uri),
-                        "uri": uri,
-                    })
-        except Exception as e:
-            print(f"spotapi playlist tracks failed: {e}")
-
-    # --- Fallback: oEmbed (playlist-level info only, no track list) ---
-    if not tracks:
-        pl_url = f"https://open.spotify.com/playlist/{spotify_id}"
-        data = _spotify_oembed(pl_url)
-        if data:
-            meta = {
-                "name": data.get("title", "Unknown Playlist"),
-                "owner": "Unknown",
-                "total": 0,
-                "thumb": data.get("thumbnail_url"),
-            }
-    return tracks, meta
-
-
-def parse_spotify_url(url):
-    """
-    Parse any Spotify URL.
-    Returns dict: {content_type, tracks: [...], meta: {...}}
-    content_type is one of: track, album, playlist, artist, unknown
-
-    Uses spotapi (public, NO API keys, NO login) for full metadata + track
-    lists. Falls back to oEmbed if spotapi is unavailable.
-    """
-    content_type, spotify_id = detect_spotify_content_type(url)
-    if not content_type:
-        return {"content_type": "unknown", "tracks": [], "meta": {}}
-
-    if content_type == "track":
-        # spotapi first (rich metadata), then oEmbed fallback
-        t = _parse_spotify_track_spotapi(spotify_id) or _parse_spotify_track_public(url)
-        if t:
-            return {"content_type": "track", "tracks": [t], "meta": {"track": t}}
-        return {"content_type": "track", "tracks": [], "meta": {}}
-
-    if content_type == "album":
-        tracks, meta = _parse_spotify_album(spotify_id)
-        return {"content_type": "album", "tracks": tracks, "meta": meta}
-
-    if content_type == "playlist":
-        tracks, meta = _parse_spotify_playlist(spotify_id)
-        return {"content_type": "playlist", "tracks": tracks, "meta": meta}
-
-    if content_type == "artist":
-        # Artist pages don't expose a clean public track list; record metadata
-        # and let the UI inform the user.
-        data = _spotify_oembed(url) or {}
-        meta = {
-            "name": data.get("title", "Unknown Artist"),
-            "thumb": data.get("thumbnail_url"),
+            log.warning(f"paginate_album error: {e}")
+        return {
+            'name': au.get('name'),
+            'artist': artist,
+            'cover': cover,
+            'year': year,
+            'total': total,
+            'tracks': tracks,
+            'type': 'album',
         }
-        return {"content_type": "artist", "tracks": [], "meta": meta}
+    except Exception as e:
+        log.warning(f"spotapi album parse failed for {spotify_id}: {e}")
+        return None
 
-    return {"content_type": "unknown", "tracks": [], "meta": {}}
+def _parse_spotify_playlist(spotify_id: str) -> Optional[dict]:
+    """Parse a Spotify playlist via spotapi."""
+    if not SPOTAPI_AVAILABLE:
+        return None
+    try:
+        p = SpotapiPublicPlaylist(spotify_id)
+        data = p.get_playlist_info()
+        pv = deep_get(data, 'data', 'playlistV2', default={})
+        if not pv:
+            return None
+        owner = deep_get(pv, 'ownerV2', 'data', 'name')
+        # Cover: images.items[0].sources[]
+        cover = None
+        img_items = deep_get(pv, 'images', 'items', default=[])
+        if img_items:
+            cover = best_image_from_sources(img_items[0].get('sources', []))
+        total = deep_get(pv, 'content', 'totalCount')
+        tracks = []
+        try:
+            for page in p.paginate_playlist():
+                if isinstance(page, dict):
+                    for item in page.get('items', []):
+                        d = deep_get(item, 'itemV2', 'data', default={})
+                        if not d:
+                            continue
+                        t_artist = deep_get(d, 'artists', 'items', 0, 'profile', 'name')
+                        t_cover = best_image_from_sources(deep_get(d, 'albumOfTrack', 'coverArt', 'sources', default=[]))
+                        tracks.append({
+                            'name': d.get('name'),
+                            'uri': d.get('uri'),
+                            'url': _uri_to_url(d.get('uri', '')),
+                            'duration_ms': deep_get(d, 'trackDuration', 'totalMilliseconds'),
+                            'artist': t_artist,
+                            'album': deep_get(d, 'albumOfTrack', 'name'),
+                            'cover': t_cover,
+                        })
+        except Exception as e:
+            log.warning(f"paginate_playlist error: {e}")
+        return {
+            'name': pv.get('name'),
+            'owner': owner,
+            'cover': cover,
+            'total': total,
+            'tracks': tracks,
+            'type': 'playlist',
+        }
+    except Exception as e:
+        log.warning(f"spotapi playlist parse failed for {spotify_id}: {e}")
+        return None
 
+def parse_spotify_url(url: str) -> Optional[dict]:
+    """Parse any Spotify URL and return unified info dict."""
+    ptype = detect_spotify_content_type(url)
+    if not ptype:
+        return None
+    sid = _spotify_id_from_url(url, ptype)
+    if not sid:
+        return None
+    if ptype == 'track':
+        info = _parse_spotify_track_spotapi(sid)
+        if info:
+            info['type'] = 'track'
+            return info
+        # Fallback to oEmbed
+        oe = _spotify_oembed(url)
+        if oe:
+            oe['type'] = 'track'
+            return oe
+        return None
+    elif ptype == 'album':
+        info = _parse_spotify_album(sid)
+        if info:
+            return info
+        return None
+    elif ptype == 'playlist':
+        info = _parse_spotify_playlist(sid)
+        if info:
+            return info
+        return None
+    elif ptype == 'artist':
+        return {'type': 'artist', 'name': 'Artist', 'url': url,
+                'tracks': [], 'cover': None}
+    return None
 
-def _build_youtube_search_query(track):
-    """Build a YouTube search query for a Spotify track."""
-    artist = (track.get("artist") or "").strip()
-    title = (track.get("title") or "").strip()
-    if artist and title:
-        return f"{artist} - {title}"
-    return title or artist or "music"
+def _build_youtube_search_query(track: dict) -> str:
+    """Build a YouTube search query from a Spotify track dict."""
+    name = (track.get('name') or '').strip()
+    artist = (track.get('artist') or '').strip()
+    if artist and name:
+        return f"{artist} - {name}"
+    if name:
+        return name
+    if artist:
+        return artist
+    return ""
 
+def make_youtube_search_url(query: str) -> str:
+    """Build a ytsearch URL for yt-dlp."""
+    return f"ytsearch1:{query}"
 
-def download_spotify_track(track, workdir, progress_hook=None):
-    """
-    Download a single Spotify track by searching YouTube for an audio match
-    and tagging the resulting file with Spotify metadata.
-    Returns dict: {"ok": bool, "item": {...}|None, "error": str|None}
-    """
-    query = _build_youtube_search_query(track)
-    print(f"Spotify -> YouTube search: {query}")
+# ============================================================
+#  yt-dlp option builders
+# ============================================================
 
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(workdir, "%(title)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "default_search": "ytsearch",
-        "noplaylist": True,
-        "socket_timeout": 30,
-        "extractor_retries": 3,
-        "fragment_retries": 3,
-        "retry_sleep": 2,
-        "retries": 3,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ],
+def make_youtube_opts(workdir: str, format_id: str = None, progress_hook=None,
+                      proxy_url: str = None, audio_only: bool = False,
+                      cookies_path: str = None) -> dict:
+    """Build yt-dlp options for YouTube."""
+    opts = {
+        'outtmpl': os.path.join(workdir, '%(title).80B.%(ext)s'),
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'no_color': True,
+        'socket_timeout': 30,
+        'retries': 3,
+        'fragment_retries': 3,
+        'concurrent_fragment_downloads': 4,
+        'geo_bypass': True,
+        'noprogress': True,
+        'ignoreerrors': False,
     }
-    if COOKIES_AVAILABLE:
-        ydl_opts["cookies"] = COOKIES_PATH
+    if cookies_path and os.path.exists(cookies_path):
+        opts['cookiefile'] = cookies_path
+    if audio_only:
+        # Best audio, convert to MP3
+        opts['format'] = 'bestaudio/best'
+        opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '320',
+        }]
+        opts['prefer_ffmpeg'] = True
+    else:
+        if format_id:
+            # Try the selected format, fallback to best
+            opts['format'] = f"{format_id}+bestaudio/best/{format_id}/best"
+            opts['merge_output_format'] = 'mp4'
+            opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
+            opts['prefer_ffmpeg'] = True
+        else:
+            opts['format'] = 'best[ext=mp4][height<=720]/best[ext=mp4]/best'
+            opts['merge_output_format'] = 'mp4'
+    if proxy_url:
+        opts['proxy'] = proxy_url
     if progress_hook:
-        ydl_opts["progress_hooks"] = [progress_hook]
+        opts['progress_hooks'] = [progress_hook]
+    return opts
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{query}", download=True)
-            entries = info.get("entries") or []
-            if not entries:
-                return {"ok": False, "error": "no YouTube match", "item": None}
-            entry = entries[0]
-            if not entry:
-                return {"ok": False, "error": "empty YouTube entry", "item": None}
-            # Prepare the downloaded file path
-            entry["_filename"] = ydl.prepare_filename(entry)
-    except Exception as e:
-        return {"ok": False, "error": str(e), "item": None}
-
-    # Locate the resulting .mp3 file (postprocessor converted it)
-    downloaded = None
-    if os.path.exists(workdir):
-        for f in os.listdir(workdir):
-            if f.lower().endswith(".mp3"):
-                downloaded = os.path.join(workdir, f)
-                break
-    if not downloaded:
-        # Fallback to the yt-dlp reported filename
-        downloaded = entry.get("_filename")
-        if downloaded and not os.path.exists(downloaded):
-            base, _ = os.path.splitext(downloaded)
-            downloaded = base + ".mp3"
-
-    if not downloaded or not os.path.exists(downloaded):
-        return {"ok": False, "error": "downloaded file not found", "item": None}
-
-    # Rename to "Artist - Title.mp3" for a clean filename
-    artist = file_processor.sanitize_name(track.get("artist") or "Unknown Artist")
-    title = file_processor.sanitize_name(track.get("title") or "Unknown Track")
-    final_fp = os.path.join(workdir, f"{artist} - {title}.mp3")
-    try:
-        if downloaded != final_fp:
-            # Avoid name collisions
-            if os.path.exists(final_fp):
-                os.remove(final_fp)
-            os.rename(downloaded, final_fp)
-    except Exception as e:
-        print(f"Spotify rename failed: {e}")
-        final_fp = downloaded
-
-    # Tag with Spotify metadata + cover art
-    file_processor._tag_audio_file(final_fp, artist, title, track.get("thumb"))
-
-    # Download cover thumbnail for the Telegram audio message
-    thumb_file = file_processor.download_thumb(track.get("thumb"), workdir)
-
-    try:
-        size = os.path.getsize(final_fp)
-    except Exception:
-        size = 0
-
-    item = {
-        "filepath": final_fp,
-        "title": track.get("title") or "Unknown Track",
-        "artist": track.get("artist") or "Unknown Artist",
-        "album": track.get("album"),
-        "size": size,
-        "duration": track.get("duration") or 0,
-        "thumb_file": thumb_file,
-        "ext": "mp3",
+def make_sc_opts(workdir: str, quality: str = 'high', progress_hook=None,
+                 force_mp3: bool = False, proxy_url: str = None) -> dict:
+    """Build yt-dlp options for SoundCloud."""
+    quality_map = {
+        'high': '320',
+        'medium': '128',
+        'low': '64',
     }
-    return {"ok": True, "item": item, "error": None}
+    abr = quality_map.get(quality, '320')
+    opts = {
+        'outtmpl': os.path.join(workdir, '%(title).80B.%(ext)s'),
+        'noplaylist': False,
+        'quiet': True,
+        'no_warnings': True,
+        'no_color': True,
+        'socket_timeout': 30,
+        'retries': 3,
+        'geo_bypass': True,
+        'noprogress': True,
+        'ignoreerrors': True,  # Continue playlist even if one track fails
+    }
+    # SoundCloud: get best audio and convert to MP3 at chosen bitrate
+    if force_mp3 or quality in ('high', 'medium', 'low'):
+        opts['format'] = 'http_mp3_128/bestaudio/best'
+        opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': abr,
+        }]
+        opts['prefer_ffmpeg'] = True
+    else:
+        opts['format'] = 'bestaudio/best'
+    if proxy_url:
+        opts['proxy'] = proxy_url
+    if progress_hook:
+        opts['progress_hooks'] = [progress_hook]
+    return opts
+
+def make_generic_opts(workdir: str, progress_hook=None, proxy_url: str = None,
+                      audio_only: bool = False) -> dict:
+    """Build yt-dlp options for generic platforms (Pinterest, Instagram, TikTok, Twitter)."""
+    opts = {
+        'outtmpl': os.path.join(workdir, '%(title).80B.%(ext)s'),
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'no_color': True,
+        'socket_timeout': 30,
+        'retries': 3,
+        'geo_bypass': True,
+        'noprogress': True,
+        'ignoreerrors': False,
+    }
+    # Use a realistic user-agent for platforms that block bots
+    opts['http_headers'] = {
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/128.0.0.0 Safari/537.36'),
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+    if audio_only:
+        opts['format'] = 'bestaudio/best'
+        opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
+        opts['prefer_ffmpeg'] = True
+    else:
+        # Best video+audio up to 1080p, merge to mp4.
+        # Use bestvideo*+bestaudio/best to handle HLS/DASH streams (Pinterest, Instagram)
+        # where video and audio are separate tracks.
+        opts['format'] = ('bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
+                          'bestvideo[height<=1080]+bestaudio/'
+                          'best[ext=mp4][height<=1080]/best[ext=mp4]/best')
+        opts['merge_output_format'] = 'mp4'
+    if proxy_url:
+        opts['proxy'] = proxy_url
+    if progress_hook:
+        opts['progress_hooks'] = [progress_hook]
+    return opts
+
+def make_tiktok_opts(workdir: str, progress_hook=None) -> dict:
+    """TikTok-specific options with anti-block measures.
+    TikTok blocks desktop UAs and redirects regional traffic to /about.
+    We use a mobile UA + the mobile API endpoint to bypass this.
+    """
+    opts = make_generic_opts(workdir, progress_hook=progress_hook)
+    # TikTok blocks desktop UAs; use a mobile UA (bypasses most blocks)
+    opts['http_headers'] = {
+        'User-Agent': ('Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/128.0.0.0 Mobile Safari/537.36'),
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.tiktok.com/',
+    }
+    # Allow merging video+audio (TikTok serves them separately in some cases)
+    opts['format'] = ('bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+                      'best[ext=mp4]/best')
+    opts['merge_output_format'] = 'mp4'
+    # Use the mobile/share endpoint to avoid regional redirects
+    opts['extractor_args'] = {'tiktok': {'download_addr': 'api'}}
+    return opts
+
+def make_twitter_opts(workdir: str, progress_hook=None) -> dict:
+    """Twitter/X-specific options."""
+    opts = make_generic_opts(workdir, progress_hook=progress_hook)
+    opts['http_headers'] = {
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/128.0.0.0 Safari/537.36'),
+        'Authorization': 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
+    }
+    return opts
+
+# ============================================================
+#  Sync download functions (run in threads via asyncio.to_thread)
+# ============================================================
+
+def _extract_info_sync(url: str, opts: dict) -> dict:
+    """Run yt-dlp extract_info synchronously."""
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+def _download_sync(url: str, opts: dict) -> Tuple[Optional[dict], Optional[str]]:
+    """Run yt-dlp download synchronously. Returns (info_dict, filepath)."""
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if not info:
+            return None, None
+        # Find the downloaded file
+        filepath = ydl.prepare_filename(info)
+        # Post-processors may change extension
+        if 'requested_downloads' in info and info['requested_downloads']:
+            rd = info['requested_downloads'][0]
+            if 'filepath' in rd:
+                filepath = rd['filepath']
+            elif 'file' in rd:
+                filepath = rd['file']
+        # Check if file exists; if not, try common extensions
+        if not os.path.exists(filepath):
+            base, _ = os.path.splitext(filepath)
+            for ext in ('.mp3', '.mp4', '.m4a', '.webm', '.opus', '.ogg', '.flac', '.wav'):
+                candidate = base + ext
+                if os.path.exists(candidate):
+                    filepath = candidate
+                    break
+        return info, (filepath if os.path.exists(filepath) else None)
+
+async def extract_info_async(url: str, opts: dict) -> dict:
+    return await asyncio.to_thread(_extract_info_sync, url, opts)
+
+async def download_async(url: str, opts: dict) -> Tuple[Optional[dict], Optional[str]]:
+    return await asyncio.to_thread(_download_sync, url, opts)
+
+# ============================================================
+#  Spotify download (search YouTube, download, tag with cover)
+# ============================================================
+
+def _download_spotify_track_sync(track: dict, workdir: str, progress_hook=None) -> Tuple[Optional[str], Optional[dict]]:
+    """Download a Spotify track by searching YouTube. Returns (filepath, yt_info)."""
+    query = _build_youtube_search_query(track)
+    if not query:
+        return None, None
+    search_url = make_youtube_search_url(query)
+    opts = make_youtube_opts(workdir, audio_only=True, progress_hook=progress_hook,
+                             cookies_path=COOKIES_PATH if COOKIES_AVAILABLE else None)
+    try:
+        info, filepath = _download_sync(search_url, opts)
+        if filepath:
+            # Embed metadata + cover
+            embed_audio_metadata(
+                filepath,
+                title=track.get('name'),
+                artist=track.get('artist'),
+                album=track.get('album'),
+                cover_url=track.get('cover'),
+                track_num=track.get('track_number'),
+                year=str(track.get('year')) if track.get('year') else None,
+            )
+            return filepath, info
+    except Exception as e:
+        log.warning(f"Spotify track download failed for {query}: {e}")
+    return None, None
+
+async def download_spotify_track(track: dict, workdir: str, progress_hook=None) -> Tuple[Optional[str], Optional[dict]]:
+    """Async wrapper for Spotify track download."""
+    return await asyncio.to_thread(_download_spotify_track_sync, track, workdir, progress_hook)
 
 
 # ============================================================
-# ===== Spotify flow orchestration (UI + senders) =====
+#  SoundCloud download (with retry + proxy rotation)
 # ============================================================
-def handle_download_spotify(chat_id, url):
-    """Entry point for Spotify links - detects content type and shows options."""
-    msg = bot.send_message(chat_id, tr(chat_id, "spotify_processing"))
-    msg_id = msg.message_id
 
-    try:
-        parsed = parse_spotify_url(url)
-        content_type = parsed.get("content_type", "unknown")
-        tracks = parsed.get("tracks", [])
-        meta = parsed.get("meta", {})
-
-        if content_type == "unknown":
-            bot.edit_message_text(tr(chat_id, "spotify_invalid_url"), chat_id, msg_id)
-            return
-
-        if content_type == "track":
-            if not tracks:
-                bot.edit_message_text(tr(chat_id, "spotify_no_match"), chat_id, msg_id)
-                return
-            # Download the single track directly
-            bot.edit_message_text(tr(chat_id, "spotify_track_detected"), chat_id, msg_id)
-            _spotify_download_single(chat_id, tracks[0], url, msg_id)
-            return
-
-        if content_type == "artist":
-            # Artist links can't be reliably expanded without API + top-tracks endpoint.
-            bot.edit_message_text(tr(chat_id, "spotify_unsupported_type"), chat_id, msg_id)
-            return
-
-        # album or playlist
-        if not tracks:
-            # No API + oEmbed only gives album-level info
-            bot.edit_message_text(tr(chat_id, "spotify_unsupported_type"), chat_id, msg_id)
-            return
-
-        # Cache the parsed result so callbacks can use it
-        save_spotify_cache(chat_id, url, content_type, tracks, meta)
-
-        count = len(tracks)
-        if content_type == "album":
-            header = tr(chat_id, "spotify_album_detected", count=count)
-            if meta.get("name"):
-                info_text = tr(
-                    chat_id, "spotify_album_info",
-                    name=meta.get("name", ""),
-                    artist=meta.get("artist", ""),
-                    count=count,
-                    year=meta.get("year", "-"),
-                )
-                header += "\n\n" + info_text
-        else:  # playlist
-            header = tr(chat_id, "spotify_playlist_detected", count=count)
-            if meta.get("name"):
-                info_text = tr(
-                    chat_id, "spotify_playlist_info",
-                    name=meta.get("name", ""),
-                    owner=meta.get("owner", ""),
-                    count=count,
-                )
-                header += "\n\n" + info_text
-
-        kb = create_spotify_keyboard(chat_id, content_type, count)
-        bot.edit_message_text(header, chat_id, msg_id, reply_markup=kb)
-
-    except Exception as e:
-        print(f"Spotify handler error: {e}")
+def _download_soundcloud_sync(url: str, workdir: str, quality: str = 'high',
+                              is_search: bool = False, search_limit: int = 15,
+                              progress_hook=None, max_retries: int = 5) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
+    """Download SoundCloud content. Returns (info, filepath, error).
+    Strategy: try DIRECT first (SoundCloud is usually accessible), then proxy fallback.
+    """
+    last_err = None
+    # Build the list of attempts: first 2 direct, then rotate proxies
+    attempt_proxies = []
+    for i in range(max(2, max_retries // 2)):
+        attempt_proxies.append(None)  # direct first
+    if ENABLE_PROXY_FOR_SOUNDCLOUD and ENABLE_PROXY_ROTATION:
+        for i in range(max_retries - len(attempt_proxies)):
+            p = proxy_mgr.next()
+            if p:
+                attempt_proxies.append(p)
+    # If we have fewer attempts than max_retries, pad with direct
+    while len(attempt_proxies) < max_retries:
+        attempt_proxies.append(None)
+    for attempt, proxy_url in enumerate(attempt_proxies[:max_retries]):
+        opts = make_sc_opts(workdir, quality=quality, progress_hook=progress_hook,
+                            force_mp3=FORCE_MP3 or True, proxy_url=proxy_url)
         try:
-            bot.edit_message_text(tr(chat_id, "error", err=str(e)), chat_id, msg_id)
-        except Exception:
-            pass
-
-
-def _spotify_download_single(chat_id, track, original_url, msg_id):
-    """Download one Spotify track and send it to the user."""
-    progress_bar = ProgressBar(chat_id, msg_id)
-
-    def hook(d):
-        try:
-            if d.get("status") == "downloading":
-                done = d.get("downloaded_bytes", 0)
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                progress_bar.update(done, total)
-        except Exception:
-            pass
-
-    title = track.get("title", "track")
-    safe_edit_message(tr(chat_id, "spotify_downloading_track", title=title), chat_id, msg_id)
-
-    tmpdir = tempfile.mkdtemp(prefix="spotify_")
-    try:
-        res = download_spotify_track(track, tmpdir, progress_hook=hook)
-        if not res.get("ok"):
-            safe_edit_message(tr(chat_id, "error", err=res.get("error", "failed")), chat_id, msg_id)
-            return
-        item = res["item"]
-        # Force .mp3 extension
-        item["filepath"] = force_audio_extension(item["filepath"])
-        # Make sure extension is mp3
-        base, ext = os.path.splitext(item["filepath"])
-        if ext.lower() != ".mp3":
-            try:
-                new_fp = base + ".mp3"
-                os.rename(item["filepath"], new_fp)
-                item["filepath"] = new_fp
-            except Exception:
-                pass
-        item["ext"] = "mp3"
-        send_spotify_item(chat_id, item, original_url)
-    except Exception as e:
-        safe_edit_message(tr(chat_id, "error", err=str(e)), chat_id, msg_id)
-    finally:
-        if tmpdir and os.path.exists(tmpdir):
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def _spotify_download_all(chat_id, tracks, original_url, msg_id, audio_only=True):
-    """Download all tracks from a Spotify album/playlist sequentially."""
-    total = len(tracks)
-    failed = 0
-    done = 0
-
-    for i, track in enumerate(tracks, 1):
-        try:
-            safe_edit_message(
-                tr(chat_id, "spotify_partial_done", done=i - 1, total=total) +
-                f"\n\n{tr(chat_id, 'spotify_downloading_track', title=track.get('title', 'track'))}",
-                chat_id, msg_id,
-            )
-            tmpdir = tempfile.mkdtemp(prefix="spotify_all_")
-            try:
-                res = download_spotify_track(track, tmpdir)
-                if res.get("ok") and res.get("item"):
-                    item = res["item"]
-                    item["filepath"] = force_audio_extension(item["filepath"])
-                    base, ext = os.path.splitext(item["filepath"])
-                    if ext.lower() != ".mp3":
-                        try:
-                            new_fp = base + ".mp3"
-                            os.rename(item["filepath"], new_fp)
-                            item["filepath"] = new_fp
-                        except Exception:
-                            pass
-                    item["ext"] = "mp3"
-                    send_spotify_item(chat_id, item, original_url)
-                    done += 1
-                else:
-                    failed += 1
-                    print(f"Spotify track {i} failed: {res.get('error')}")
-            finally:
-                if tmpdir and os.path.exists(tmpdir):
-                    shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception as e:
-            failed += 1
-            print(f"Spotify track {i} exception: {e}")
-
-    if done > 0:
-        if failed > 0:
-            safe_edit_message(
-                tr(chat_id, "spotify_download_failed", failed=failed, total=total),
-                chat_id, msg_id,
-            )
-        else:
-            safe_edit_message(
-                tr(chat_id, "spotify_download_complete", count=done),
-                chat_id, msg_id,
-            )
-    else:
-        safe_edit_message(tr(chat_id, "spotify_no_match"), chat_id, msg_id)
-
-
-def send_spotify_item(chat_id, item, original_url=None):
-    """Send a downloaded Spotify track as an audio message."""
-    caption = caption_builder.build_caption(chat_id, "Spotify", item, original_url)
-
-    # Send cover art first (optional, makes the chat prettier)
-    if item.get("thumb_file"):
-        try:
-            with open(item["thumb_file"], "rb") as tf:
-                bot.send_photo(chat_id, tf, caption=tr(chat_id, "cover_sent"))
-        except Exception:
-            pass
-
-    if item["size"] <= TELEGRAM_UPLOAD_LIMIT:
-        with open(item["filepath"], "rb") as f:
-            kwargs = {
-                "caption": caption,
-                "performer": item.get("artist", "Unknown Artist"),
-                "title": item.get("title", "Unknown Track"),
-                "duration": item.get("duration") or None,
-            }
-            if item.get("thumb_file"):
-                try:
-                    with open(item["thumb_file"], "rb") as tf:
-                        kwargs["thumb"] = tf
-                        bot.send_audio(chat_id, f, **kwargs)
-                except Exception:
-                    bot.send_audio(chat_id, f, **kwargs)
-            else:
-                bot.send_audio(chat_id, f, **kwargs)
-        add_stats_with_platform(chat_id, "Spotify", "audio", item["size"])
-    else:
-        bot.send_message(chat_id, tr(chat_id, "error", err=f"File too large: {human_size(item['size'])}"))
-
-
-# ===== Spotify callback handler =====
-def handle_spotify_selection(call):
-    """Handle Spotify inline keyboard callbacks."""
-    chat_id = call.message.chat.id
-    message_id = call.message.message_id
-    data = call.data or ""
-
-    try:
-        action = data.split(":", 1)[1] if ":" in data else ""
-    except Exception:
-        action = ""
-
-    cache = get_spotify_cache(chat_id)
-
-    if action == "cancel":
-        try:
-            bot.delete_message(chat_id, message_id)
-        except Exception:
-            pass
-        clear_spotify_cache(chat_id)
-        bot.answer_callback_query(call.id)
-        return
-
-    if action == "back":
-        # Back to album/playlist options
-        if not cache:
-            try:
-                bot.delete_message(chat_id, message_id)
-            except Exception:
-                pass
-            bot.answer_callback_query(call.id)
-            return
-        tracks = cache.get("tracks", [])
-        meta = cache.get("meta", {})
-        ct = cache.get("content_type", "album")
-        count = len(tracks)
-        if ct == "album":
-            header = tr(chat_id, "spotify_album_detected", count=count)
-            if meta.get("name"):
-                header += "\n\n" + tr(
-                    chat_id, "spotify_album_info",
-                    name=meta.get("name", ""), artist=meta.get("artist", ""),
-                    count=count, year=meta.get("year", "-"),
-                )
-        else:
-            header = tr(chat_id, "spotify_playlist_detected", count=count)
-            if meta.get("name"):
-                header += "\n\n" + tr(
-                    chat_id, "spotify_playlist_info",
-                    name=meta.get("name", ""), owner=meta.get("owner", ""),
-                    count=count,
-                )
-        kb = create_spotify_keyboard(chat_id, ct, count)
-        try:
-            bot.edit_message_text(header, chat_id, message_id, reply_markup=kb)
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id)
-        return
-
-    if action == "pick":
-        # Show paginated track picker
-        if not cache:
-            bot.answer_callback_query(call.id, "Expired")
-            return
-        tracks = cache.get("tracks", [])
-        kb = create_spotify_track_keyboard(tracks, chat_id, 0, per_page=10)
-        try:
-            bot.edit_message_text(tr(chat_id, "spotify_choose_track"), chat_id, message_id, reply_markup=kb)
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id)
-        return
-
-    if action == "all" or action == "audio_all":
-        # Download every track in the cached album/playlist
-        if not cache:
-            bot.answer_callback_query(call.id, "Expired")
-            return
-        tracks = cache.get("tracks", [])
-        url = cache.get("url")
-        bot.answer_callback_query(call.id)
-        _spotify_download_all(chat_id, tracks, url, message_id, audio_only=True)
-        clear_spotify_cache(chat_id)
-        return
-
-    # spotify_pick:<idx> - download a single chosen track
-    if action.startswith("pick:"):
-        try:
-            idx = int(action.split(":", 1)[1])
-        except Exception:
-            bot.answer_callback_query(call.id, "Invalid")
-            return
-        if not cache:
-            bot.answer_callback_query(call.id, "Expired")
-            return
-        tracks = cache.get("tracks", [])
-        url = cache.get("url")
-        if idx < 0 or idx >= len(tracks):
-            bot.answer_callback_query(call.id, "Invalid")
-            return
-        track = tracks[idx]
-        bot.answer_callback_query(call.id, "OK")
-        # Delete the picker message
-        try:
-            bot.delete_message(chat_id, message_id)
-        except Exception:
-            pass
-        new_msg = bot.send_message(chat_id, tr(chat_id, "spotify_send_track"))
-        _spotify_download_single(chat_id, track, url, new_msg.message_id)
-        return
-
-    # spotify_page:<n> - paginate the track picker
-    if action.startswith("page:"):
-        try:
-            page = int(action.split(":", 1)[1])
-        except Exception:
-            bot.answer_callback_query(call.id, "Invalid page")
-            return
-        if not cache:
-            bot.answer_callback_query(call.id, "Expired")
-            return
-        tracks = cache.get("tracks", [])
-        kb = create_spotify_track_keyboard(tracks, chat_id, page, per_page=10)
-        try:
-            bot.edit_message_text(tr(chat_id, "spotify_choose_track"), chat_id, message_id, reply_markup=kb)
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id)
-        return
-
-    bot.answer_callback_query(call.id)
-
-# ===== Enhanced Pinterest Downloader =====
-def download_pinterest_enhanced(url: str, workdir: str, progress_hook=None):
-    """Enhanced Pinterest downloader with better error handling and multiple strategies"""
-    print(f"Starting enhanced Pinterest download for: {url}")
-    
-    # Multiple download strategies
-    strategies = [
-        # Strategy 1: Direct yt-dlp with custom headers
-        {
-            "format": "best",
-            "outtmpl": os.path.join(workdir, "%(title)s.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate",
-                "DNT": "1",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-            },
-            "nocheckcertificate": True,
-            "ignoreerrors": True,
-            "extractor_retries": 3,
-            "socket_timeout": 20,
-        },
-        # Strategy 2: Mobile user agent
-        {
-            "format": "best",
-            "outtmpl": os.path.join(workdir, "%(title)s.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
-            },
-            "nocheckcertificate": True,
-            "ignoreerrors": True,
-            "extractor_retries": 3,
-        },
-        # Strategy 3: Generic fallback
-        {
-            "format": "bestvideo+bestaudio/bestvideo/bestaudio/best",
-            "outtmpl": os.path.join(workdir, "%(title)s.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "nocheckcertificate": True,
-            "ignoreerrors": True,
-        }
-    ]
-    
-    for i, opts in enumerate(strategies, 1):
-        try:
-            print(f"Trying Pinterest strategy {i}/{len(strategies)}")
-            
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                
                 if not info:
-                    print(f"Strategy {i}: No info extracted")
+                    last_err = "No info returned"
                     continue
-                
-                info["_filename"] = ydl.prepare_filename(info)
-                item = finalize_generic_item(info, workdir)
-                
-                if item:
-                    print(f"Strategy {i}: Successfully downloaded Pinterest content")
-                    return {"item": item, "ok": True}
-                else:
-                    print(f"Strategy {i}: Failed to finalize item")
-                    continue
-                    
+                # Find file
+                filepath = None
+                if 'requested_downloads' in info and info['requested_downloads']:
+                    rd = info['requested_downloads'][0]
+                    filepath = rd.get('filepath') or rd.get('file')
+                if not filepath:
+                    filepath = ydl.prepare_filename(info)
+                # Try common extensions
+                if filepath and not os.path.exists(filepath):
+                    base, _ = os.path.splitext(filepath)
+                    for ext in ('.mp3', '.mp4', '.m4a', '.webm', '.opus', '.ogg', '.flac', '.wav'):
+                        c = base + ext
+                        if os.path.exists(c):
+                            filepath = c
+                            break
+                if filepath and os.path.exists(filepath):
+                    return info, filepath, None
+                last_err = "File not found after download"
+        except yt_dlp.utils.DownloadError as e:
+            last_err = str(e)
+            log.warning(f"SoundCloud attempt {attempt+1} (proxy={proxy_url}): {e}")
+            if proxy_url:
+                proxy_mgr.mark_bad(proxy_url)
+            time.sleep(1 + attempt)
         except Exception as e:
-            print(f"Strategy {i} failed: {str(e)}")
-            if i == len(strategies):
-                return {"error": f"All Pinterest strategies failed. Last error: {str(e)}", "ok": False}
-            continue
-    
-    return {"error": "All Pinterest download strategies failed", "ok": False}
+            last_err = str(e)
+            log.warning(f"SoundCloud attempt {attempt+1} error: {e}")
+            time.sleep(1 + attempt)
+    return None, None, last_err
 
-def resolve_url(url: str) -> str:
-    try:
-        r = requests.head(url, allow_redirects=True, timeout=10)
-        return r.url or url
-    except Exception:
-        return url
+async def download_soundcloud(url: str, workdir: str, quality: str = 'high',
+                              is_search: bool = False, search_limit: int = 15,
+                              progress_hook=None, max_retries: int = 5):
+    """Async wrapper for SoundCloud download."""
+    return await asyncio.to_thread(_download_soundcloud_sync, url, workdir, quality,
+                                   is_search, search_limit, progress_hook, max_retries)
 
-def estimate_file_size(format_info, duration_seconds):
-    """Estimate file size based on format info and duration"""
-    try:
-        # Get bitrate information
-        if format_info.get("vcodec") != "none" and format_info.get("acodec") != "none":
-            # Video + audio
-            vbr = format_info.get("vbr", 0) or format_info.get("tbr", 0) or 1000  # Default to 1000 kbps
-            abr = format_info.get("abr", 0) or 128  # Default to 128 kbps for audio
-            total_bitrate = vbr + abr
-        elif format_info.get("vcodec") == "none" and format_info.get("acodec") != "none":
-            # Audio only
-            total_bitrate = format_info.get("abr", 0) or format_info.get("tbr", 0) or 128
-        else:
-            # Video only or unknown
-            total_bitrate = format_info.get("tbr", 0) or 1000
-        
-        # Calculate size (in bytes)
-        size_bits = total_bitrate * 1000 * duration_seconds  # Convert kbps to bits
-        size_bytes = size_bits / 8  # Convert bits to bytes
-        
-        # Add some buffer (10%)
-        size_bytes *= 1.1
-        
-        return int(size_bytes)
-        
-    except Exception as e:
-        print(f"Error estimating file size: {e}")
-        # Return a conservative estimate
-        return 10 * 1024 * 1024  # 10MB default# Telegram Downloader Bot: Enhanced Version - Part 4
-# YouTube Handlers, Statistics, and Core Functionality
+# ============================================================
+#  YouTube info & download
+# ============================================================
 
-# ===== YouTube Handler with Shorts Detection =====
-def handle_download_youtube(chat_id, url):
-    """Handle YouTube download with quality selection and Shorts detection"""
-    lang = get_user_lang(chat_id) or "en"
-    
-    # Check if it's a YouTube Short
-    is_short = is_youtube_short(url)
-    
-    # If URL detection is inconclusive, check video info
-    if is_short is None:
-        is_short = confirm_youtube_short(url)
-    
-    if is_short:
-        print(f"YouTube Short detected: {url}")
-        # Handle as YouTube Short
-        msg = bot.send_message(chat_id, tr(chat_id, "youtube_shorts_detected"))
-        msg_id = msg.message_id
-        
-        try:
-            # Save URL for later use
-            save_youtube_shorts_info(chat_id, url, True)
-            
-            # Create selection keyboard with new format
-            kb = create_youtube_shorts_keyboard(chat_id)
-            
-            # Update message with selection options
-            bot.edit_message_text(tr(chat_id, "youtube_shorts_prompt"), chat_id, msg_id, reply_markup=kb)
-            
-        except Exception as e:
-            bot.edit_message_text(tr(chat_id, "error", err=str(e)), chat_id, msg_id)
-    else:
-        print(f"Regular YouTube video detected: {url}")
-        # Handle as regular YouTube video
-        msg = bot.send_message(chat_id, tr(chat_id, "youtube_processing"))
-        msg_id = msg.message_id
-        
-        try:
-            # Get available qualities with merging
-            qualities = get_youtube_qualities_with_merging(url, chat_id)
-            
-            if not qualities:
-                bot.edit_message_text(tr(chat_id, "youtube_no_qualities"), chat_id, msg_id)
-                return
-            
-            # Save URL for later use
-            save_youtube_qualities(chat_id, url, qualities)
-            
-            # Create quality selection keyboard with new format
-            kb = create_youtube_quality_keyboard(qualities, chat_id)
-            
-            # Update message with quality selection
-            bot.edit_message_text(tr(chat_id, "youtube_quality_prompt"), chat_id, msg_id, reply_markup=kb)
-            
-        except Exception as e:
-            bot.edit_message_text(tr(chat_id, "error", err=str(e)), chat_id, msg_id)
+def is_youtube_short(url: str) -> bool:
+    """Quick check if URL is a YouTube Short."""
+    u = (url or '').lower()
+    return '/shorts/' in u
 
-# ===== Generic handlers for other platforms =====
-def handle_download_pinterest(chat_id, url):
-    handle_generic_download(chat_id, url, "Pinterest")
-
-def handle_download_instagram(chat_id, url):
-    handle_generic_download(chat_id, url, "Instagram")
-
-def handle_download_tiktok(chat_id, url):
-    handle_generic_download(chat_id, url, "TikTok")
-
-def handle_download_twitter(chat_id, url):
-    handle_generic_download(chat_id, url, "Twitter")
-
-def handle_generic_download(chat_id, url, platform):
-    """Generic download with optimized progress bar"""
-    msg = bot.send_message(chat_id, tr(chat_id, "downloading"))
-    msg_id = msg.message_id
-
-    # Create progress bar instance
-    progress_bar = ProgressBar(chat_id, msg_id)
-
-    def hook(d):
-        try:
-            if d.get("status") == "downloading":
-                done = d.get("downloaded_bytes", 0)
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                progress_bar.update(done, total)
-        except Exception as e:
-            pass
-
-    tmpdir = tempfile.mkdtemp(prefix="gendl_")
-    try:
-        res = download_generic(url, tmpdir, progress_hook=hook)
-        if not res.get("ok"):
-            safe_edit_message(tr(chat_id, "error", err=res.get("error", "failed")), chat_id, msg_id)
-            return
-
-        if "playlist" in res:
-            for item in res["playlist"]:
-                send_media_item(chat_id, item, platform, url)
-        else:
-            item = res["item"]
-            send_media_item(chat_id, item, platform, url)
-    except Exception as e:
-        safe_edit_message(tr(chat_id, "error", err=str(e)), chat_id, msg_id)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-# ===== Generic download functions =====
-def download_generic(url: str, workdir: str, progress_hook=None):
-    """Generic download with smart platform detection"""
-    if "pinterest.com" in url or "pin.it" in url:
-        print("Detected Pinterest URL, using enhanced downloader")
-        return download_pinterest_enhanced(url, workdir, progress_hook)
-
-    opts = make_generic_opts(workdir, progress_hook=progress_hook)
-
+def _get_youtube_info_sync(url: str) -> Optional[dict]:
+    """Extract YouTube video info (no download)."""
+    opts = {
+        'quiet': True, 'no_warnings': True, 'no_color': True,
+        'skip_download': True, 'noplaylist': True,
+        'socket_timeout': 30, 'retries': 2,
+        'geo_bypass': True,
+    }
+    if COOKIES_AVAILABLE:
+        opts['cookiefile'] = COOKIES_PATH
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-
-            if not info:
-                return {"error": "No info extracted from URL", "ok": False}
-
-            entries = info.get("entries")
-            if entries and isinstance(entries, list):
-                items = []
-                for e in entries:
-                    if e:
-                        e["_filename"] = ydl.prepare_filename(e)
-                        it = finalize_generic_item(e, workdir)
-                        if it:
-                            items.append(it)
-                return {"playlist": items, "ok": True} if items else {"error": "No valid items found", "ok": False}
-            else:
-                info["_filename"] = ydl.prepare_filename(info)
-                it = finalize_generic_item(info, workdir)
-                if it:
-                    return {"item": it, "ok": True}
-                return {"error": "Failed to finalize item", "ok": False}
+            return ydl.extract_info(url, download=False)
     except Exception as e:
-        return {"error": str(e), "ok": False}
+        log.warning(f"YouTube info extraction failed: {e}")
+        return None
 
-# ===== SoundCloud flow =====
-def handle_download_soundcloud(chat_id, url):
-    content_type = detect_content_type(url)
-    lang = get_user_lang(chat_id) or "en"
+async def get_youtube_info(url: str) -> Optional[dict]:
+    return await asyncio.to_thread(_get_youtube_info_sync, url)
 
-    if content_type == "playlist":
-        msg = bot.send_message(chat_id, tr(chat_id, "downloading_playlist"))
-        msg_id = msg.message_id
+def _get_youtube_qualities_sync(url: str) -> List[dict]:
+    """Get available video qualities for a YouTube URL."""
+    info = _get_youtube_info_sync(url)
+    if not info or not info.get('formats'):
+        return []
+    qualities = []
+    seen = set()
+    for f in info['formats']:
+        if f.get('vcodec') and f['vcodec'] != 'none' and f.get('height'):
+            h = f['height']
+            fid = f.get('format_id', '')
+            fps = f.get('fps', 30)
+            ext = f.get('ext', 'mp4')
+            label = f"{h}p"
+            if fps > 30:
+                label += f"_{fps}"
+            if label in seen:
+                continue
+            seen.add(label)
+            # Check if this format has both video and audio
+            has_audio = f.get('acodec') and f['acodec'] != 'none'
+            qualities.append({
+                'label': label,
+                'format_id': fid,
+                'height': h,
+                'fps': fps,
+                'ext': ext,
+                'has_audio': has_audio,
+            })
+    # Sort by height descending
+    qualities.sort(key=lambda q: (q['height'], q['fps']), reverse=True)
+    return qualities
 
-        tmpdir = tempfile.mkdtemp(prefix="scdl_")
-        try:
-            ydl_opts_flat = {
-                "quiet": True, "no_warnings": True, "extract_flat": True,
-                "simulate": True, "skip_download": True,
-            }
+async def get_youtube_qualities(url: str) -> List[dict]:
+    return await asyncio.to_thread(_get_youtube_qualities_sync, url)
 
-            with yt_dlp.YoutubeDL(ydl_opts_flat) as ydl:
-                info = ydl.extract_info(url, download=False)
+def _download_youtube_sync(url: str, workdir: str, format_id: str = None,
+                           audio_only: bool = False, progress_hook=None) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
+    """Download a YouTube video."""
+    opts = make_youtube_opts(workdir, format_id=format_id, progress_hook=progress_hook,
+                             audio_only=audio_only,
+                             cookies_path=COOKIES_PATH if COOKIES_AVAILABLE else None)
+    try:
+        info, filepath = _download_sync(url, opts)
+        if filepath:
+            return info, filepath, None
+        return info, None, "File not found"
+    except Exception as e:
+        return None, None, str(e)
 
-                if "entries" in info and info["entries"]:
-                    entries = [e for e in info["entries"] if e]
+async def download_youtube(url: str, workdir: str, format_id: str = None,
+                           audio_only: bool = False, progress_hook=None):
+    return await asyncio.to_thread(_download_youtube_sync, url, workdir, format_id,
+                                   audio_only, progress_hook)
 
-                    bot.edit_message_text(tr(chat_id, "playlist_detected", count=len(entries)), chat_id, msg_id)
+# ============================================================
+#  Generic download (Pinterest, Instagram, TikTok, Twitter)
+# ============================================================
 
-                    playlist_items = []
-
-                    for i, e in enumerate(entries):
-                        if not e.get("title") or e.get("title") == "Unknown Title":
-                            try:
-                                single_opts = {
-                                    "quiet": True, "no_warnings": True, "extract_flat": False,
-                                    "simulate": True, "skip_download": True,
-                                }
-
-                                with yt_dlp.YoutubeDL(single_opts) as ydl_single:
-                                    track_url = e.get("url") or e.get("webpage_url", "")
-                                    if track_url:
-                                        track_info = ydl_single.extract_info(track_url, download=False)
-                                        e = track_info
-                            except Exception as ex:
-                                print(f"Error getting track info: {ex}")
-
-                        title = e.get("title")
-                        if not title or title == "Unknown Title":
-                            url_text = e.get("webpage_url", e.get("url", ""))
-                            if url_text:
-                                import re
-                                url_match = re.search(r'/([^/]+)(?:\?|$)', url_text)
-                                if url_match:
-                                    title = url_match.group(1).replace('-', ' ').replace('_', ' ').title()
-
-                        artist = extract_artist(e)
-                        if not artist or artist == "unknown":
-                            if title and " - " in title:
-                                artist = title.split(" - ")[0].strip()
-                                title = title.split(" - ", 1)[1].strip()
-
-                        final_title = title if title else f"Track {i+1}"
-                        final_artist = artist if artist else "Unknown Artist"
-
-                        playlist_items.append({
-                            "title": final_title, "artist": final_artist,
-                            "url": e.get("webpage_url", e.get("url", "")),
-                            "duration": e.get("duration", 0), "thumb": e.get("thumbnail"),
-                        })
-
-                        if (i + 1) % 5 == 0:
-                            bot.edit_message_text(tr(chat_id, "processing_playlist") + f" ({i+1}/{len(entries)})", chat_id, msg_id)
-
-                    # Save playlist choices and send keyboard
-                    save_playlist_choices(chat_id, playlist_items)
-
-                    kb = create_paginated_keyboard(playlist_items, chat_id, 0, 10, "playlist")
-                    bot.send_message(chat_id, tr(chat_id, "playlist_song_selection"), reply_markup=kb)
-                else:
-                    bot.edit_message_text(tr(chat_id, "no_results_found"), chat_id, msg_id)
-                    
-        except Exception as e:
-            bot.edit_message_text(tr(chat_id, "error", err=str(e)), chat_id, msg_id)
-        finally:
-            # Clean up AFTER processing (very important!)
-            if tmpdir and os.path.exists(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
+def _download_generic_sync(url: str, workdir: str, platform: str = 'generic',
+                           progress_hook=None) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
+    """Download from a generic platform."""
+    if platform == 'tiktok':
+        opts = make_tiktok_opts(workdir, progress_hook=progress_hook)
+    elif platform == 'twitter':
+        opts = make_twitter_opts(workdir, progress_hook=progress_hook)
     else:
-        handle_single_soundcloud(chat_id, url)
-
-def handle_single_soundcloud(chat_id, url):
-    """Download single SoundCloud track with proxy support and retry logic"""
-    msg = bot.send_message(chat_id, tr(chat_id, "downloading_single"))
-    msg_id = msg.message_id
-
-    # Create progress bar instance
-    progress_bar = ProgressBar(chat_id, msg_id)
-    proxy_retry_notified = False
-
-    def hook(d):
-        nonlocal proxy_retry_notified
-        try:
-            if d.get("status") == "downloading":
-                done = d.get("downloaded_bytes", 0)
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                progress_bar.update(done, total)
-        except Exception as e:
-            pass
-
-    def download_with_retry():
-        nonlocal proxy_retry_notified
-        
-        for attempt in range(3):  # Maximum 3 attempts
-            proxy_url = None
-            
-            # First attempt without proxy, subsequent attempts with proxy
-            if attempt > 0 and ENABLE_PROXY_FOR_SOUNDCLOUD:
-                if not proxy_retry_notified:
-                    bot.edit_message_text(tr(chat_id, "geo_restriction_error"), chat_id, msg_id)
-                    proxy_retry_notified = True
-                else:
-                    bot.edit_message_text(tr(chat_id, "proxy_retry"), chat_id, msg_id)
-                
-                # Get a working proxy from proxy manager
-                proxy_url = proxy_manager.get_working_proxy()
-                
-                if proxy_url:
-                    print(f"Attempt {attempt + 1}: Using proxy {proxy_url}")
-                else:
-                    print(f"Attempt {attempt + 1}: No proxy available, trying without")
-                    proxy_url = None
-            
-            tmpdir = tempfile.mkdtemp(prefix="scdl_")
-            try:
-                res = download_soundcloud_with_retry(url, tmpdir, get_user_quality(chat_id), is_search=False, progress_hook=hook, max_retries=1)
-                
-                if res.get("ok"):
-                    return res, tmpdir
-                else:
-                    error_msg = res.get("error", "failed")
-                    print(f"Attempt {attempt + 1} failed: {error_msg}")
-                    
-                    # Check if it's a geo-restriction error
-                    if "geo restriction" in error_msg.lower() or "not available from your location" in error_msg.lower():
-                        if attempt < 2:  # Don't give up yet
-                            # Clean up and continue to next attempt
-                            if tmpdir and os.path.exists(tmpdir):
-                                shutil.rmtree(tmpdir, ignore_errors=True)
-                            continue
-                    
-                    # If it's last attempt, return error with tmpdir for cleanup
-                    if attempt == 2:
-                        return res, tmpdir
-                        
-            except Exception as e:
-                print(f"Attempt {attempt + 1} exception: {str(e)}")
-                if attempt == 2:
-                    return {"error": str(e), "ok": False}, tmpdir
-            
-            # Clean up on failed attempts (except last one)
-            if tmpdir and os.path.exists(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
-        
-        return {"error": "All attempts failed", "ok": False}, None
-
+        opts = make_generic_opts(workdir, progress_hook=progress_hook)
     try:
-        res, tmpdir = download_with_retry()
-        
-        if not res.get("ok"):
-            safe_edit_message(tr(chat_id, "error", err=res.get("error", "failed")), chat_id, msg_id)
-            # Clean up on error
-            if tmpdir and os.path.exists(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
-            return
-
-        item = res["item"]
-        
-        try:
-            send_sc_item(chat_id, item, url)
-        except Exception as e:
-            print(f"Error sending item: {e}")
-            safe_edit_message(tr(chat_id, "error", err=f"Failed to send file: {str(e)}"), chat_id, msg_id)
-        finally:
-            # Clean up AFTER sending (very important!)
-            if tmpdir and os.path.exists(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
-        
+        info, filepath = _download_sync(url, opts)
+        if filepath:
+            return info, filepath, None
+        return info, None, "File not found"
+    except yt_dlp.utils.DownloadError as e:
+        err = str(e)
+        # Provide friendlier error messages
+        if 'no video' in err.lower() or 'no video could be found' in err.lower():
+            return None, None, 'no_video'
+        if 'private' in err.lower() or 'unavailable' in err.lower() or 'not exist' in err.lower():
+            return None, None, 'private'
+        if 'rate-limited' in err.lower() or '429' in err:
+            return None, None, 'rate_limited'
+        return None, None, err
     except Exception as e:
-        safe_edit_message(tr(chat_id, "error", err=str(e)), chat_id, msg_id)
-        # Clean up on any error
-        try:
-            if 'tmpdir' in locals() and tmpdir and os.path.exists(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
-        except:
-            pass
+        return None, None, str(e)
 
-# ===== Forced join =====
-def is_member(chat_id):
+async def download_generic(url: str, workdir: str, platform: str = 'generic',
+                           progress_hook=None):
+    return await asyncio.to_thread(_download_generic_sync, url, workdir, platform, progress_hook)
+
+# ============================================================
+#  Send functions (audio/video/document + HD cover)
+# ============================================================
+
+async def send_hd_cover(chat_id: int, cover_url: str, caption: str = None,
+                        reply_to: int = None) -> bool:
+    """Send an HD cover image as a photo. Returns True on success."""
+    if not cover_url:
+        return False
+    data = download_cover_bytes(cover_url)
+    if not data:
+        return False
+    # Ensure JPEG format
+    data = ensure_jpeg_bytes(data)
     try:
-        m = bot.get_chat_member(CHANNEL_USERNAME, chat_id)
-        return m.status in ("member", "administrator", "creator")
-    except Exception:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=BufferedInputFile(data, filename="cover.jpg"),
+            caption=caption,
+            reply_to_message_id=reply_to,
+        )
+        return True
+    except Exception as e:
+        log.warning(f"send_hd_cover failed: {e}")
         return False
 
-def join_keyboard(chat_id):
-    lang = get_user_lang(chat_id) or "en"
-    kb = InlineKeyboardMarkup()
-    if lang == "fa":
-        label = "📢 عضویت در کانال"
+async def send_audio_file(chat_id: int, filepath: str, title: str = None,
+                          artist: str = None, duration: int = None,
+                          cover_path: str = None, caption: str = None,
+                          reply_to: int = None) -> bool:
+    """Send an audio file. Uses send_audio with thumbnail."""
+    try:
+        thumb = None
+        if cover_path and os.path.exists(cover_path):
+            thumb = FSInputFile(cover_path)
+        await bot.send_audio(
+            chat_id=chat_id,
+            audio=FSInputFile(filepath),
+            caption=caption,
+            title=title,
+            performer=artist,
+            duration=duration,
+            thumbnail=thumb,
+            reply_to_message_id=reply_to,
+        )
+        return True
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        try:
+            thumb = FSInputFile(cover_path) if cover_path and os.path.exists(cover_path) else None
+            await bot.send_audio(
+                chat_id=chat_id, audio=FSInputFile(filepath), caption=caption,
+                title=title, performer=artist, duration=duration, thumbnail=thumb,
+                reply_to_message_id=reply_to,
+            )
+            return True
+        except Exception as e2:
+            log.warning(f"send_audio_file retry failed: {e2}")
+            return False
+    except Exception as e:
+        log.warning(f"send_audio_file failed: {e}")
+        # Fallback: send as document
+        try:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=FSInputFile(filepath),
+                caption=caption,
+                reply_to_message_id=reply_to,
+            )
+            return True
+        except Exception as e2:
+            log.warning(f"send_audio_file document fallback failed: {e2}")
+            return False
+
+async def send_video_file(chat_id: int, filepath: str, caption: str = None,
+                          duration: int = None, width: int = None, height: int = None,
+                          cover_path: str = None, reply_to: int = None) -> bool:
+    """Send a video file."""
+    try:
+        thumb = FSInputFile(cover_path) if cover_path and os.path.exists(cover_path) else None
+        await bot.send_video(
+            chat_id=chat_id,
+            video=FSInputFile(filepath),
+            caption=caption,
+            duration=duration,
+            width=width,
+            height=height,
+            thumbnail=thumb,
+            reply_to_message_id=reply_to,
+            supports_streaming=True,
+        )
+        return True
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        try:
+            thumb = FSInputFile(cover_path) if cover_path and os.path.exists(cover_path) else None
+            await bot.send_video(
+                chat_id=chat_id, video=FSInputFile(filepath), caption=caption,
+                duration=duration, width=width, height=height, thumbnail=thumb,
+                reply_to_message_id=reply_to, supports_streaming=True,
+            )
+            return True
+        except Exception as e2:
+            log.warning(f"send_video_file retry failed: {e2}")
+            return False
+    except Exception as e:
+        log.warning(f"send_video_file failed: {e}")
+        # Fallback: send as document
+        try:
+            await bot.send_document(
+                chat_id=chat_id, document=FSInputFile(filepath), caption=caption,
+                reply_to_message_id=reply_to,
+            )
+            return True
+        except Exception as e2:
+            log.warning(f"send_video_file document fallback failed: {e2}")
+            return False
+
+async def send_document_file(chat_id: int, filepath: str, caption: str = None,
+                             reply_to: int = None) -> bool:
+    """Send a file as document (for files > 50MB or unsupported types)."""
+    try:
+        await bot.send_document(
+            chat_id=chat_id,
+            document=FSInputFile(filepath),
+            caption=caption,
+            reply_to_message_id=reply_to,
+        )
+        return True
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        try:
+            await bot.send_document(
+                chat_id=chat_id, document=FSInputFile(filepath), caption=caption,
+                reply_to_message_id=reply_to,
+            )
+            return True
+        except Exception as e2:
+            log.warning(f"send_document_file retry failed: {e2}")
+            return False
+    except Exception as e:
+        log.warning(f"send_document_file failed: {e}")
+        return False
+
+async def send_media_item(chat_id: int, filepath: str, is_audio: bool, caption: str,
+                          title: str = None, artist: str = None, duration: int = None,
+                          cover_path: str = None, width: int = None, height: int = None,
+                          reply_to: int = None) -> bool:
+    """Send a media file (audio or video) with the appropriate method."""
+    file_size = get_actual_file_size(filepath)
+    if file_size > TELEGRAM_UPLOAD_LIMIT:
+        # Too large — send as document (no size limit for documents? Actually still 50MB for bots)
+        return await send_document_file(chat_id, filepath, caption, reply_to)
+    if is_audio:
+        return await send_audio_file(chat_id, filepath, title=title, artist=artist,
+                                     duration=duration, cover_path=cover_path,
+                                     caption=caption, reply_to=reply_to)
     else:
-        label = "📢 Join channel"
-    kb.row(InlineKeyboardButton(text=label, url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"))
-    return kb
+        return await send_video_file(chat_id, filepath, caption=caption, duration=duration,
+                                     width=width, height=height, cover_path=cover_path,
+                                     reply_to=reply_to)
 
-# ===== Keyboards =====
-def lang_keyboard():
-    kb = InlineKeyboardMarkup()
-    kb.row(
-        InlineKeyboardButton(text="🇮🇷 فارسی", callback_data="start_lang:fa"),
-        InlineKeyboardButton(text="🇬🇧 English", callback_data="start_lang:en"),
-    )
-    return kb
+# ============================================================
+#  Resolve short URLs (t.co, pin.it, on.soundcloud.com, etc.)
+# ============================================================
 
-def sc_quality_keyboard(chat_id):
-    lang = get_user_lang(chat_id) or "en"
-    kb = InlineKeyboardMarkup()
-    if lang == "fa":
-        high_label = "🎧 کیفیت بالا"
-        low_label = "🔉 کیفیت سبک"
-    else:
-        high_label = "🎧 High quality"
-        low_label = "🔉 Light quality"
-    kb.row(
-        InlineKeyboardButton(text=high_label, callback_data="quality:high"),
-        InlineKeyboardButton(text=low_label, callback_data="quality:low"),
-    )
-    return kb
+def resolve_url(url: str, timeout: int = 10) -> str:
+    """Follow redirects to get the final URL."""
+    try:
+        r = requests.head(url, timeout=timeout, allow_redirects=True,
+                          headers={'User-Agent': 'Mozilla/5.0'})
+        if r.url and r.url != url:
+            return r.url
+    except Exception:
+        pass
+    return url
 
-def create_spotify_keyboard(chat_id, content_type, track_count):
-    """Create colorful Spotify action keyboard for albums & playlists."""
-    kb = InlineKeyboardMarkup()
-    # Row 1: download all / pick a track (strings already include emoji)
-    kb.row(
-        InlineKeyboardButton(text=tr(chat_id, "spotify_download_all"), callback_data="spotify:all"),
-        InlineKeyboardButton(text=tr(chat_id, "spotify_download_single"), callback_data="spotify:pick")
-    )
-    # Row 2: audio-only info
-    kb.row(
-        InlineKeyboardButton(text=tr(chat_id, "spotify_download_audio"), callback_data="spotify:audio_all")
-    )
-    kb.row(InlineKeyboardButton(text=tr(chat_id, "close_menu"), callback_data="spotify:cancel"))
-    return kb
+async def resolve_url_async(url: str) -> str:
+    return await asyncio.to_thread(resolve_url, url)
 
-def create_spotify_track_keyboard(tracks, chat_id, page=0, per_page=10):
-    """Paginated keyboard to pick a single Spotify track from album/playlist."""
-    kb = InlineKeyboardMarkup()
-    if not tracks:
-        return kb
+# ============================================================
+#  Keyboards (InlineKeyboardBuilder with coloured buttons)
+# ============================================================
 
-    start_idx = page * per_page
-    end_idx = min(start_idx + per_page, len(tracks))
+def main_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """Main menu keyboard with coloured buttons."""
+    b = InlineKeyboardBuilder()
+    b.row(styled_button("🎵 " + tr(chat_id, 'menu_quality'), ButtonStyle.WARNING, callback_data="menu:quality"))
+    b.row(styled_button("🌐 " + tr(chat_id, 'menu_language'), ButtonStyle.PRIMARY, callback_data="menu:language"))
+    b.row(styled_button("📊 " + tr(chat_id, 'menu_stats'), ButtonStyle.PRIMARY, callback_data="menu:stats"))
+    b.row(styled_button("🔍 " + tr(chat_id, 'menu_search'), ButtonStyle.SUCCESS, callback_data="menu:search"))
+    b.row(styled_button("❓ " + tr(chat_id, 'menu_help'), ButtonStyle.INFO, callback_data="menu:help"))
+    return b.as_markup()
 
-    for i in range(start_idx, end_idx):
+def join_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """Channel subscription keyboard."""
+    b = InlineKeyboardBuilder()
+    ch = CHANNEL_USERNAME.lstrip('@')
+    b.row(styled_button("📢 " + tr(chat_id, 'join_btn'), ButtonStyle.DANGER,
+                        url=f"https://t.me/{ch}"))
+    b.row(styled_button("🔄 " + tr(chat_id, 'check_btn'), ButtonStyle.SUCCESS,
+                        callback_data="check:join"))
+    return b.as_markup()
+
+def lang_keyboard() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(styled_button("🇮🇷 فارسی", ButtonStyle.PRIMARY, callback_data="lang:fa"))
+    b.row(styled_button("🇬🇧 English", ButtonStyle.PRIMARY, callback_data="lang:en"))
+    return b.as_markup()
+
+def sc_quality_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(styled_button("🟢 " + tr(chat_id, 'sc_quality_high'), ButtonStyle.SUCCESS, callback_data="scq:high"))
+    b.row(styled_button("🟡 " + tr(chat_id, 'sc_quality_medium'), ButtonStyle.WARNING, callback_data="scq:medium"))
+    b.row(styled_button("⚪ " + tr(chat_id, 'sc_quality_low'), ButtonStyle.NEUTRAL, callback_data="scq:low"))
+    b.row(styled_button("🔙 " + tr(chat_id, 'menu_back'), ButtonStyle.PRIMARY, callback_data="menu:main"))
+    return b.as_markup()
+
+def create_spotify_keyboard(chat_id: int, content_type: str, track_count: int) -> InlineKeyboardMarkup:
+    """Spotify action keyboard for album/playlist."""
+    b = InlineKeyboardBuilder()
+    if content_type in ('album', 'playlist'):
+        b.row(styled_button(
+            tr(chat_id, 'btn_download_all').format(count=track_count),
+            ButtonStyle.SUCCESS, callback_data="sp:all"))
+        b.row(styled_button(
+            tr(chat_id, 'btn_pick_track'),
+            ButtonStyle.PRIMARY, callback_data="sp:pick:0"))
+    b.row(styled_button("🚫 " + tr(chat_id, 'btn_cancel'), ButtonStyle.DANGER, callback_data="sp:cancel"))
+    return b.as_markup()
+
+def create_spotify_track_keyboard(tracks: list, chat_id: int, page: int = 0,
+                                  per_page: int = 8) -> InlineKeyboardMarkup:
+    """Paginated track picker for Spotify album/playlist."""
+    b = InlineKeyboardBuilder()
+    start = page * per_page
+    end = min(start + per_page, len(tracks))
+    for i in range(start, end):
         t = tracks[i]
-        artist = t.get("artist", "Unknown Artist")
-        title = t.get("title", "Unknown Track")
-        label = f"🎵 {artist} - {title}"
-        kb.row(InlineKeyboardButton(text=label[:64], callback_data=f"spotify_pick:{i}"))
-
-    nav_row = []
+        title = t.get('name', f'Track {i+1}')
+        artist = t.get('artist', '')
+        label = f"{i+1}. {title}"
+        if artist:
+            label += f" — {artist[:20]}"
+        if len(label) > 40:
+            label = label[:37] + '...'
+        b.row(styled_button(label, ButtonStyle.PRIMARY, callback_data=f"spp:{i}"))
+    # Pagination
+    nav = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text=tr(chat_id, "previous_page"), callback_data="spotify_page:%d" % (page - 1)))
+        nav.append(styled_button("⬅️ " + tr(chat_id, 'btn_prev'), ButtonStyle.PRIMARY,
+                                 callback_data=f"sppg:{page-1}"))
+    nav.append(styled_button("✖️ " + tr(chat_id, 'btn_close'), ButtonStyle.DANGER,
+                             callback_data="sp:cancel"))
+    if end < len(tracks):
+        nav.append(styled_button(tr(chat_id, 'btn_next') + " ➡️", ButtonStyle.PRIMARY,
+                                 callback_data=f"sppg:{page+1}"))
+    if nav:
+        b.row(*nav)
+    # Back to main
+    b.row(styled_button("🔙 " + tr(chat_id, 'menu_back'), ButtonStyle.WARNING,
+                        callback_data="sp:back"))
+    return b.as_markup()
 
-    total_pages = (len(tracks) + per_page - 1) // per_page
-    nav_row.append(InlineKeyboardButton(text=tr(chat_id, "page_number", page=page + 1, total_pages=total_pages), callback_data="noop"))
+def create_youtube_quality_keyboard(qualities: list, chat_id: int) -> InlineKeyboardMarkup:
+    """YouTube quality picker."""
+    b = InlineKeyboardBuilder()
+    # Audio only option
+    b.row(styled_button("🎵 " + tr(chat_id, 'yt_audio_only'), ButtonStyle.SUCCESS,
+                        callback_data="yt:audio"))
+    # Video qualities (max 8)
+    for q in qualities[:8]:
+        style = ButtonStyle.PRIMARY
+        if q['height'] >= 1080:
+            style = ButtonStyle.SUCCESS
+        elif q['height'] >= 720:
+            style = ButtonStyle.WARNING
+        b.row(styled_button(f"🎬 {q['label']}", style,
+                            callback_data=f"ytv:{q['format_id']}"))
+    b.row(styled_button("🚫 " + tr(chat_id, 'btn_cancel'), ButtonStyle.DANGER,
+                        callback_data="yt:cancel"))
+    return b.as_markup()
 
-    if end_idx < len(tracks):
-        nav_row.append(InlineKeyboardButton(text=tr(chat_id, "next_page"), callback_data="spotify_page:%d" % (page + 1)))
-
-    if nav_row:
-        kb.row(*nav_row)
-
-    kb.row(InlineKeyboardButton(text="🔙 " + tr(chat_id, "back_to_stats"), callback_data="spotify:back"))
-    return kb
-
-def create_paginated_keyboard(choices, chat_id, page=0, per_page=15, prefix="search"):
-    """Create paginated keyboard"""
-    lang = get_user_lang(chat_id) or "en"
-    kb = InlineKeyboardMarkup()
-
-    if not choices:
-        return kb
-
-    start_idx = page * per_page
-    end_idx = min(start_idx + per_page, len(choices))
-
-    for i in range(start_idx, end_idx):
+def create_paginated_keyboard(choices: list, chat_id: int, page: int = 0,
+                              per_page: int = 8, prefix: str = "search") -> InlineKeyboardMarkup:
+    """Generic paginated keyboard for search/playlist results."""
+    b = InlineKeyboardBuilder()
+    start = page * per_page
+    end = min(start + per_page, len(choices))
+    for i in range(start, end):
         ch = choices[i]
-        if prefix == "search":
-            artist = ch.get("artist", "Unknown Artist")
-            title = ch.get("title", "Unknown Title")
-            label = f"🎵 {i+1}. {artist} - {title}"
-            callback_data = f"pick:{i}"
-        elif prefix == "playlist":
-            artist = ch.get("artist", "Unknown Artist")
-            title = ch.get("title", "Unknown Title")
-            label = f"🎵 {artist} - {title}"
-            callback_data = f"playlist_pick:{i}"
-        else:
-            title = ch.get("title", "Unknown Title")
-            label = f"{i+1}. {title}"
-            callback_data = f"pick:{i}"
-
-        kb.row(InlineKeyboardButton(text=label[:64], callback_data=callback_data))
-
-    nav_row = []
+        title = ch.get('title', f'Item {i+1}')
+        if len(title) > 45:
+            title = title[:42] + '...'
+        b.row(styled_button(f"{i+1}. {title}", ButtonStyle.PRIMARY,
+                            callback_data=f"{prefix}:{i}"))
+    nav = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text=tr(chat_id, "previous_page"), callback_data=f"{prefix}_page:{page-1}"))
+        nav.append(styled_button("⬅️", ButtonStyle.PRIMARY, callback_data=f"{prefix}pg:{page-1}"))
+    nav.append(styled_button("✖️ " + tr(chat_id, 'btn_close'), ButtonStyle.DANGER,
+                             callback_data=f"{prefix}:cancel"))
+    if end < len(choices):
+        nav.append(styled_button("➡️", ButtonStyle.PRIMARY, callback_data=f"{prefix}pg:{page+1}"))
+    if nav:
+        b.row(*nav)
+    return b.as_markup()
 
-    total_pages = (len(choices) + per_page - 1) // per_page
-    nav_row.append(InlineKeyboardButton(text=tr(chat_id, "page_number", page=page+1, total_pages=total_pages), callback_data="noop"))
+def stats_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(styled_button("📊 " + tr(chat_id, 'stats_period_all'), ButtonStyle.PRIMARY, callback_data="stat:all"))
+    b.row(styled_button("📅 " + tr(chat_id, 'stats_period_weekly'), ButtonStyle.WARNING, callback_data="stat:weekly"))
+    b.row(styled_button("📅 " + tr(chat_id, 'stats_period_daily'), ButtonStyle.NEUTRAL, callback_data="stat:daily"))
+    b.row(styled_button("🔙 " + tr(chat_id, 'menu_back'), ButtonStyle.PRIMARY, callback_data="menu:main"))
+    return b.as_markup()
 
-    if end_idx < len(choices):
-        nav_row.append(InlineKeyboardButton(text=tr(chat_id, "next_page"), callback_data=f"{prefix}_page:{page+1}"))
+def cancel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(styled_button("🚫 " + tr(chat_id, 'btn_cancel'), ButtonStyle.DANGER, callback_data="cancel:op"))
+    return b.as_markup()
 
-    if nav_row:
-        kb.row(*nav_row)
 
-    return kb
+# ============================================================
+#  Spotify download orchestration (UI flow)
+# ============================================================
 
-# ===== Features message =====
-def send_features_message(chat_id):
-    lang = get_user_lang(chat_id)
-    header = T[lang]["features_header"]
-    lines = T[lang]["features_lines"]
-    companion = T[lang]["companion_label"].format(id=COMPANION_ID)
-    text = header + "\n" + "\n".join(lines) + "\n" + companion
-    bot.send_message(chat_id, text)
-
-# ===== Statistics Functions =====
-def get_stats_text(chat_id):
-    """Get statistics text for message editing"""
-    user_stats = get_stats(chat_id)
-    uptime_stats = get_uptime_stats()
-
-    text = f"📊 {tr(chat_id, 'stats_title')}\n\n"
-    text += f"👤 {tr(chat_id, 'your_stats')}:\n"
-    text += f"📁 {tr(chat_id, 'downloads')}: {user_stats['user_count']}\n"
-    text += f"💾 {tr(chat_id, 'volume')}: {human_size(user_stats['user_bytes'])}\n\n"
-
-    text += f"🌍 {tr(chat_id, 'global_stats')}:\n"
-    text += f"📁 {tr(chat_id, 'downloads')}: {user_stats['total_count']}\n"
-    text += f"💾 {tr(chat_id, 'volume')}: {human_size(user_stats['total_bytes'])}\n"
-    text += f"⏱️ {tr(chat_id, 'uptime')}: {uptime_stats['uptime']}\n"
-    text += f"\n"
-    text += f"🔍 {tr(chat_id, 'choose_category')}:"
-
-    return text
-
-def send_stats_main(chat_id):
-    """Send main statistics page"""
-    text = get_stats_text(chat_id)
-    bot.send_message(chat_id, text, reply_markup=create_stats_keyboard(chat_id))
-
-def edit_stats_main(chat_id, message_id):
-    """Edit main statistics page (instead of sending new message)"""
-    text = get_stats_text(chat_id)
-    try:
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=create_stats_keyboard(chat_id))
-    except Exception as e:
-        print(f"Error editing stats message: {e}")
-        # If editing fails, send new message
-        bot.send_message(chat_id, text, reply_markup=create_stats_keyboard(chat_id))
-
-def send_top_users_stats(chat_id, message_id, period='all'):
-    """Send top users statistics - with message editing"""
-    if period == 'daily':
-        top_users = get_top_users_daily(3)
-        title = tr(chat_id, 'daily_top_user_stats')
-        user_period = 'daily'
-    elif period == 'weekly':
-        top_users = get_top_users_weekly(3)
-        title = tr(chat_id, 'weekly_top_user_stats')
-        user_period = 'weekly'
-    else:
-        top_users = get_top_users_all_time(3)
-        title = tr(chat_id, 'top_user_stats')
-        user_period = 'all'
-
-    if not top_users:
-        try:
-            bot.edit_message_text(tr(chat_id, 'no_data'), chat_id, message_id, reply_markup=create_back_keyboard(chat_id))
-        except Exception as e:
-            print(f"Error editing message: {e}")
-            bot.send_message(chat_id, tr(chat_id, 'no_data'), reply_markup=create_back_keyboard(chat_id))
+async def handle_download_spotify(chat_id: int, url: str, status_msg: Message):
+    """Handle a Spotify URL: parse, show keyboard, wait for user choice."""
+    await safe_edit_message(status_msg, f"🔍 Parsing Spotify URL...")
+    info = await asyncio.to_thread(parse_spotify_url, url)
+    if not info:
+        await safe_edit_message(status_msg, tr(chat_id, 'err_not_supported'))
         return
-
-    text = f"{title}\n\n"
-
-    for i, user in enumerate(top_users, 1):
-        text += f"🏅 {tr(chat_id, 'rank')} {i}\n"
-        text += f"👤 {tr(chat_id, 'user')}: {user['display_name']}\n"
-        text += f"📁 {tr(chat_id, 'downloads')}: {user['download_count']}\n"
-        text += f"💾 {tr(chat_id, 'volume')}: {human_size(user['total_size'])}\n"
-        text += f"🎯 {tr(chat_id, 'most_used')}: {user['most_used_platform']}\n\n"
-
-    # Add referring user's statistics
-    user_stats = get_user_stats(chat_id, user_period)
-    if user_stats['count'] > 0:
-        if user_period == 'daily':
-            text += f"📊 {tr(chat_id, 'your_daily_stats')}:\n"
-        elif user_period == 'weekly':
-            text += f"📊 {tr(chat_id, 'your_weekly_stats')}:\n"
+    ptype = info.get('type')
+    if ptype == 'track':
+        # Single track: download immediately
+        await _spotify_download_single(chat_id, info, url, status_msg)
+    elif ptype in ('album', 'playlist'):
+        # Save to cache and show keyboard
+        save_spotify_cache(chat_id, url, ptype, info.get('tracks', []),
+                           {'name': info.get('name'), 'artist': info.get('artist'),
+                            'owner': info.get('owner'), 'cover': info.get('cover'),
+                            'year': info.get('year'), 'type': ptype})
+        # Build info message
+        cb = CaptionBuilder(chat_id)
+        icon = "💿" if ptype == 'album' else "📋"
+        cb.lines.append(f"{icon} <b>{info.get('name', 'Unknown')}</b>")
+        if ptype == 'album':
+            if info.get('artist'):
+                cb.lines.append(f"🎤 {info['artist']}")
+            if info.get('year'):
+                cb.lines.append(f"📅 {info['year']}")
         else:
-            text += f"📊 {tr(chat_id, 'your_stats')}:\n"
-
-        text += f"📁 {tr(chat_id, 'downloads')}: {user_stats['count']}\n"
-        text += f"💾 {tr(chat_id, 'volume')}: {human_size(user_stats['bytes'])}\n"
-    else:
-        if user_period == 'daily':
-            text += f"📊 {tr(chat_id, 'your_daily_stats')}: {tr(chat_id, 'no_user_data')}\n"
-        elif user_period == 'weekly':
-            text += f"📊 {tr(chat_id, 'your_weekly_stats')}: {tr(chat_id, 'no_user_data')}\n"
-        else:
-            text += f"📊 {tr(chat_id, 'your_stats')}: {tr(chat_id, 'no_user_data')}\n"
-
-    # Edit main message instead of sending new one
-    try:
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=create_back_keyboard(chat_id))
-    except Exception as e:
-        print(f"Error editing message: {e}")
-        # If editing fails, send new message
-        bot.send_message(chat_id, text, reply_markup=create_back_keyboard(chat_id))
-
-def send_top_platforms_stats(chat_id, message_id, period='all'):
-    """Send top platforms statistics"""
-    if period == 'daily':
-        platforms = get_platform_ranking_daily()
-        title = tr(chat_id, 'daily_top_platform_stats')
-        user_period = 'daily'
-    elif period == 'weekly':
-        platforms = get_platform_ranking_weekly()
-        title = tr(chat_id, 'weekly_top_platform_stats')
-        user_period = 'weekly'
-    else:
-        platforms = get_platform_ranking_all_time()
-        title = tr(chat_id, 'top_platform_stats')
-        user_period = 'all'
-
-    if not platforms:
-        try:
-            bot.edit_message_text(tr(chat_id, 'no_data'), chat_id, message_id, reply_markup=create_back_keyboard(chat_id))
-        except Exception as e:
-            print(f"Error editing message: {e}")
-            bot.send_message(chat_id, tr(chat_id, 'no_data'), reply_markup=create_back_keyboard(chat_id))
-        return
-
-    text = f"{title}\n\n"
-
-    for i, platform in enumerate(platforms, 1):
-        text += f"🏅 {tr(chat_id, 'rank')} {i}\n"
-        text += f"🎯 {tr(chat_id, 'platform')}: {platform['platform']}\n"
-        text += f"📁 {tr(chat_id, 'downloads')}: {platform['download_count']}\n"
-        text += f"💾 {tr(chat_id, 'volume')}: {human_size(platform['total_size'])}\n\n"
-
-    # Add referring user's platform statistics
-    user_platforms = get_user_platform_stats(chat_id, user_period)
-    if user_platforms:
-        if user_period == 'daily':
-            text += f"📊 {tr(chat_id, 'your_daily_stats')}:\n"
-        elif user_period == 'weekly':
-            text += f"📊 {tr(chat_id, 'your_weekly_stats')}:\n"
-        else:
-            text += f"📊 {tr(chat_id, 'your_stats')}:\n"
-
-        for platform in user_platforms:
-            text += f"🎯 {platform['platform']}: {platform['download_count']} ({human_size(platform['total_size'])})\n"
-    else:
-        if user_period == 'daily':
-            text += f"📊 {tr(chat_id, 'your_daily_stats')}: {tr(chat_id, 'no_user_data')}\n"
-        elif user_period == 'weekly':
-            text += f"📊 {tr(chat_id, 'your_weekly_stats')}: {tr(chat_id, 'no_user_data')}\n"
-        else:
-            text += f"📊 {tr(chat_id, 'your_stats')}: {tr(chat_id, 'no_user_data')}\n"
-
-    # Edit main message instead of sending new one
-    try:
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=create_back_keyboard(chat_id))
-    except Exception as e:
-        print(f"Error editing message: {e}")
-        # If editing fails, send new message
-        bot.send_message(chat_id, text, reply_markup=create_back_keyboard(chat_id))
-
-def create_stats_keyboard(chat_id):
-    """Create main statistics keyboard with close button"""
-    lang = get_user_lang(chat_id) or "en"
-    kb = InlineKeyboardMarkup()
-
-    kb.row(
-        InlineKeyboardButton(text=f"👑 {tr(chat_id, 'top_users_all_time')}", callback_data="stats:top_users_all"),
-        InlineKeyboardButton(text=f"🏆 {tr(chat_id, 'top_platforms_all_time')}", callback_data="stats:top_platforms_all")
-    )
-
-    kb.row(
-        InlineKeyboardButton(text=f"📅 {tr(chat_id, 'top_users_daily')}", callback_data="stats:top_users_daily"),
-        InlineKeyboardButton(text=f"📊 {tr(chat_id, 'top_platforms_daily')}", callback_data="stats:top_platforms_daily")
-    )
-
-    kb.row(
-        InlineKeyboardButton(text=f"📆 {tr(chat_id, 'top_users_weekly')}", callback_data="stats:top_users_weekly"),
-        InlineKeyboardButton(text=f"📈 {tr(chat_id, 'top_platforms_weekly')}", callback_data="stats:top_platforms_weekly")
-    )
-
-    # Add close button in last row
-    kb.row(InlineKeyboardButton(text=tr(chat_id, "close_menu"), callback_data="stats:close"))
-
-    return kb
-
-def create_back_keyboard(chat_id):
-    """Create back keyboard"""
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton(text=f"🔙 {tr(chat_id, 'back_to_stats')}", callback_data="stats:main"))
-    return kb# Telegram Downloader Bot: Enhanced Version - Part 5
-# Main Commands, Handlers, File Senders, and Flask Server
-
-# ===== Commands =====
-def main_menu_keyboard(chat_id):
-    """Colorful main menu keyboard shown after language selection."""
-    lang = get_user_lang(chat_id) or "en"
-    kb = InlineKeyboardMarkup()
-    if lang == "fa":
-        kb.row(
-            InlineKeyboardButton(text="🎚 کیفیت صدا", callback_data="menu:quality"),
-            InlineKeyboardButton(text="🌐 تغییر زبان", callback_data="menu:lang"),
-        )
-        kb.row(
-            InlineKeyboardButton(text="📊 آمار من", callback_data="menu:stats"),
-            InlineKeyboardButton(text="🌟 راهنما", callback_data="menu:help"),
-        )
-        kb.row(InlineKeyboardButton(text="🎵 جستجوی آهنگ", switch_inline_query_current_chat="/search "))
-    else:
-        kb.row(
-            InlineKeyboardButton(text="🎚 Audio Quality", callback_data="menu:quality"),
-            InlineKeyboardButton(text="🌐 Change Language", callback_data="menu:lang"),
-        )
-        kb.row(
-            InlineKeyboardButton(text="📊 My Stats", callback_data="menu:stats"),
-            InlineKeyboardButton(text="🌟 Help", callback_data="menu:help"),
-        )
-        kb.row(InlineKeyboardButton(text="🎵 Search Music", switch_inline_query_current_chat="/search "))
-    return kb
-
-
-@bot.message_handler(commands=["start"])
-def cmd_start(message):
-    chat_id = message.chat.id
-
-    # If user already has a language and is a member, show the menu directly
-    existing_lang = get_user_lang(chat_id)
-    if existing_lang and is_member(chat_id):
-        bot.send_message(chat_id, tr(chat_id, "send_link"), reply_markup=main_menu_keyboard(chat_id))
-        return
-
-    # Step 1: Language selection with enhanced welcome message
-    lang_keyboard = InlineKeyboardMarkup()
-    lang_keyboard.row(
-        InlineKeyboardButton(text="🇮🇷 فارسی", callback_data="start_lang:fa"),
-        InlineKeyboardButton(text="🇬🇧 English", callback_data="start_lang:en"),
-    )
-
-    welcome_text = (
-        "🌐 خوش آمدید! / Welcome!\n\n"
-        "لطفاً زبان خود را انتخاب کنید:\n"
-        "Please select your language:\n\n"
-        "🇮🇷 فارسی  |  🇬🇧 English"
-    )
-
-    bot.send_message(chat_id, welcome_text, reply_markup=lang_keyboard)
-
-@bot.message_handler(commands=["help"])
-def cmd_help(message):
-    chat_id = message.chat.id
-    if not is_member(chat_id):
-        bot.send_message(chat_id, tr(chat_id, "must_join", chan=CHANNEL_USERNAME), reply_markup=join_keyboard(chat_id))
-        return
-    send_features_message(chat_id)
-    bot.send_message(chat_id, tr(chat_id, "send_link"), reply_markup=main_menu_keyboard(chat_id))
-
-@bot.message_handler(commands=["menu"])
-def cmd_menu(message):
-    chat_id = message.chat.id
-    if not is_member(chat_id):
-        bot.send_message(chat_id, tr(chat_id, "must_join", chan=CHANNEL_USERNAME), reply_markup=join_keyboard(chat_id))
-        return
-    bot.send_message(chat_id, tr(chat_id, "send_link"), reply_markup=main_menu_keyboard(chat_id))
-
-@bot.message_handler(commands=["lang"])
-def cmd_lang(message):
-    chat_id = message.chat.id
-    if not is_member(chat_id):
-        bot.send_message(chat_id, tr(chat_id, "must_join", chan=CHANNEL_USERNAME), reply_markup=join_keyboard(chat_id))
-        return
-    bot.send_message(chat_id, tr(chat_id, "start"), reply_markup=lang_keyboard())
-
-@bot.message_handler(commands=["quality"])
-def cmd_quality(message):
-    chat_id = message.chat.id
-    if not is_member(chat_id):
-        bot.send_message(chat_id, tr(chat_id, "must_join", chan=CHANNEL_USERNAME), reply_markup=join_keyboard(chat_id))
-        return
-    bot.send_message(chat_id, tr(chat_id, "quality_prompt"), reply_markup=sc_quality_keyboard(chat_id))
-
-@bot.message_handler(commands=["stats"])
-def cmd_stats(message):
-    chat_id = message.chat.id
-    if not is_member(chat_id):
-        bot.send_message(chat_id, tr(chat_id, "must_join", chan=CHANNEL_USERNAME), reply_markup=join_keyboard(chat_id))
-        return
-
-    send_stats_main(chat_id)
-
-@bot.message_handler(commands=["search"])
-def cmd_search(message):
-    chat_id = message.chat.id
-    if not is_member(chat_id):
-        bot.send_message(chat_id, tr(chat_id, "must_join", chan=CHANNEL_USERNAME), reply_markup=join_keyboard(chat_id))
-        return
-    query = message.text.replace("/search", "").strip()
-    if not query:
-        bot.send_message(chat_id, tr(chat_id, "search_prompt"))
-        return
-    do_search(chat_id, query)
-
-def do_search(chat_id, query):
-    lang = get_user_lang(chat_id) or "en"
-
-    initial_msg = bot.send_message(chat_id, tr(chat_id, "searching"))
-    msg_id = initial_msg.message_id
-
-    tmpdir = tempfile.mkdtemp(prefix="scsrch_")
-    try:
-        ydl_opts = {
-            "quiet": True, "no_warnings": True, "extract_flat": True,
-            "simulate": True, "skip_download": True,
-            "socket_timeout": 15, "extractor_retries": 2,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            search_query = f"scsearch15:{query}"
-            info = ydl.extract_info(search_query, download=False)
-
-            entries = info.get("entries") or []
-            choices = []
-
-            if entries:
-                bot.edit_message_text(tr(chat_id, "searching_with_count", count=len(entries)), chat_id, msg_id)
-
-                for i, e in enumerate(entries):
-                    if e:
-                        title = e.get("title")
-                        if not title or title == "Unknown Title":
-                            url_text = e.get("webpage_url", e.get("url", ""))
-                            if url_text:
-                                import re
-                                url_match = re.search(r'/([^/]+)(?:\?|$)', url_text)
-                                if url_match:
-                                    title = url_match.group(1).replace('-', ' ').replace('_', ' ').title()
-
-                        artist = extract_artist(e)
-                        if not artist or artist == "unknown":
-                            if title and " - " in title:
-                                artist = title.split(" - ")[0].strip()
-                                title = title.split(" - ", 1)[1].strip()
-
-                        final_title = title if title else f"Track {i+1}"
-                        final_artist = artist if artist else "Unknown Artist"
-
-                        choices.append({
-                            "title": final_title, "artist": final_artist,
-                            "url": e.get("webpage_url", ""), "duration": e.get("duration", 0),
-                            "thumb": e.get("thumbnail"),
-                        })
-
-                        if (i + 1) % 5 == 0:
-                            bot.edit_message_text(tr(chat_id, "processing_results") + f" ({i+1}/{len(entries)})", chat_id, msg_id)
-
-        if not choices:
-            bot.edit_message_text(tr(chat_id, "no_results_found"), chat_id, msg_id)
-            return
-
-        save_search_choices(chat_id, choices)
-
-        bot.edit_message_text(tr(chat_id, "search_results_found", count=len(choices)), chat_id, msg_id)
-
-        kb = create_paginated_keyboard(choices, chat_id, 0, 10, "search")
-        bot.send_message(chat_id, tr(chat_id, "pick_from_results"), reply_markup=kb)
-
-    except Exception as e:
-        bot.edit_message_text(tr(chat_id, "error", err=str(e)), chat_id, msg_id)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-# ===== Callbacks =====
-@bot.callback_query_handler(func=lambda call: True)
-def on_callback(call):
-    chat_id = call.message.chat.id
-    data = call.data or ""
-    lang = get_user_lang(chat_id) or "en"
-
-    # Handle initial language selection
-    if data.startswith("start_lang:"):
-        _, lang = data.split(":", 1)
-        if lang in LANGS:
-            set_user_lang(chat_id, lang)
-            bot.answer_callback_query(call.id, f"Language set to {lang}")
-
-            if not is_member(chat_id):
-                join_keyboard = InlineKeyboardMarkup()
-                join_keyboard.row(InlineKeyboardButton(text="بشم، اومدم 👋", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"))
-
-                if lang == "fa":
-                    msg_text = f"برای استفاده از ربات، لطفاً عضو کانال {CHANNEL_USERNAME} شوید.\n\nبعد از عضویت روی /start بزنید:"
-                else:
-                    msg_text = f"To use the bot, please join {CHANNEL_USERNAME}.\n\nAfter joining, press /start:"
-
-                bot.send_message(chat_id, msg_text, reply_markup=join_keyboard)
-            else:
-                send_main_messages(chat_id)
-        return
-
-    # Handle YouTube quality selection
-    if data.startswith("yt_quality:"):
-        handle_youtube_quality_selection(call)
-        return
-
-    # Handle YouTube Shorts selection
-    if data.startswith("yt_shorts:"):
-        handle_youtube_shorts_selection(call)
-        return
-
-    # Handle Spotify selection (NEW)
-    if data.startswith("spotify:") or data.startswith("spotify_pick:") or data.startswith("spotify_page:"):
-        handle_spotify_selection(call)
-        return
-
-    # Handle main menu callbacks (NEW)
-    if data.startswith("menu:"):
-        _, action = data.split(":", 1)
-        try:
-            bot.delete_message(chat_id, call.message.message_id)
-        except Exception:
-            pass
-        if action == "quality":
-            bot.send_message(chat_id, tr(chat_id, "quality_prompt"), reply_markup=sc_quality_keyboard(chat_id))
-        elif action == "lang":
-            bot.send_message(chat_id, tr(chat_id, "start"), reply_markup=lang_keyboard())
-        elif action == "stats":
-            send_stats_main(chat_id)
-        elif action == "help":
-            send_features_message(chat_id)
-            bot.send_message(chat_id, tr(chat_id, "send_link"), reply_markup=main_menu_keyboard(chat_id))
-        bot.answer_callback_query(call.id)
-        return
-
-    # Handle statistics callbacks - with message editing
-    if data.startswith("stats:"):
-        _, action = data.split(":", 1)
-
-        if action == "main":
-            edit_stats_main(chat_id, call.message.message_id)
-        elif action == "close":
-            # Delete stats message
+            if info.get('owner'):
+                cb.lines.append(f"👤 {info['owner']}")
+        cb.lines.append(f"🎵 {len(info.get('tracks', []))} tracks")
+        text = cb.build()
+        kb = create_spotify_keyboard(chat_id, ptype, len(info.get('tracks', [])))
+        # Send cover + info + keyboard
+        cover_url = info.get('cover')
+        if cover_url:
             try:
-                bot.delete_message(chat_id, call.message.message_id)
+                cover_data = download_cover_bytes(cover_url)
+                if cover_data:
+                    cover_data = ensure_jpeg_bytes(cover_data)
+                    await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=BufferedInputFile(cover_data, filename="cover.jpg"),
+                        caption=text,
+                        reply_markup=kb,
+                    )
+                    await status_msg.delete()
+                    return
             except Exception as e:
-                print(f"Error deleting stats message: {e}")
-        elif action == "top_users_all":
-            send_top_users_stats(chat_id, call.message.message_id, 'all')
-        elif action == "top_users_daily":
-            send_top_users_stats(chat_id, call.message.message_id, 'daily')
-        elif action == "top_users_weekly":
-            send_top_users_stats(chat_id, call.message.message_id, 'weekly')
-        elif action == "top_platforms_all":
-            send_top_platforms_stats(chat_id, call.message.message_id, 'all')
-        elif action == "top_platforms_daily":
-            send_top_platforms_stats(chat_id, call.message.message_id, 'daily')
-        elif action == "top_platforms_weekly":
-            send_top_platforms_stats(chat_id, call.message.message_id, 'weekly')
+                log.warning(f"Could not send Spotify cover: {e}")
+        # Fallback: text only
+        await safe_edit_message(status_msg, text, reply_markup=kb)
+    else:
+        await safe_edit_message(status_msg, tr(chat_id, 'err_not_supported'))
 
-        bot.answer_callback_query(call.id)
-        return
-
-    # Handle regular callbacks
-    if data.startswith("lang:"):
-        _, lang = data.split(":", 1)
-        if lang in LANGS:
-            set_user_lang(chat_id, lang)
-            bot.answer_callback_query(call.id, tr(chat_id, "lang_set", lang=lang))
-            send_features_message(chat_id)
-    elif data.startswith("quality:"):
-        _, q = data.split(":", 1)
-        if q in ("high", "low"):
-            set_user_quality(chat_id, q)
-            bot.answer_callback_query(call.id, tr(chat_id, "quality_set", q=q))
-    elif data.startswith("pick:"):
-        idx_str = data.split(":", 1)[1]
-        try:
-            idx = int(idx_str)
-        except Exception:
-            bot.answer_callback_query(call.id, "Invalid choice")
+async def _spotify_download_single(chat_id: int, track: dict, original_url: str,
+                                   status_msg: Message):
+    """Download a single Spotify track."""
+    workdir = tempfile.mkdtemp(prefix="spotify_")
+    try:
+        # Show "searching YouTube" message
+        await safe_edit_message(status_msg,
+            f"🔍 {tr(chat_id, 'sp_searching')}\n\n🎵 <b>{track.get('name', '?')}</b>\n🎤 {track.get('artist', '')}")
+        # Progress bar
+        pb = ProgressBar(bot, chat_id, status_msg.message_id,
+                         total=0, title=f"⬇️ {tr(chat_id, 'downloading')}",
+                         lang=get_user_lang(chat_id))
+        filepath, yt_info = await download_spotify_track(track, workdir,
+                                                         progress_hook=pb.make_ytdlp_hook())
+        if not filepath:
+            await safe_edit_message(status_msg, tr(chat_id, 'err_download'))
             return
-        choice = get_search_choice(chat_id, idx)
-        bot.answer_callback_query(call.id, "OK")
-        if choice:
-            handle_download_soundcloud(chat_id, choice["url"])
-        else:
-            bot.send_message(chat_id, tr(chat_id, "error", err="choice expired"))
-    elif data.startswith("playlist_pick:"):
-        idx_str = data.split(":", 1)[1]
-        try:
-            idx = int(idx_str)
-        except Exception:
-            bot.answer_callback_query(call.id, "Invalid choice")
-            return
-        choice = get_playlist_choice(chat_id, idx)
-        bot.answer_callback_query(call.id, "OK")
-        if choice:
-            handle_download_soundcloud(chat_id, choice["url"])
-        else:
-            bot.send_message(chat_id, tr(chat_id, "error", err="choice expired"))
-    elif data.startswith("search_page:"):
-        page_str = data.split(":", 1)[1]
-        try:
-            page = int(page_str)
-        except Exception:
-            bot.answer_callback_query(call.id, "Invalid page")
-            return
-
-        with db_pool.get_connection() as conn:
-            c = conn.cursor()
-            c.execute("SELECT url, title, artist, duration FROM search_cache WHERE chat_id=? ORDER BY idx", (chat_id,))
-            rows = c.fetchall()
-
-        if rows:
-            choices = []
-            for row in rows:
-                choices.append({"url": row[0], "title": row[1], "artist": row[2], "duration": row[3]})
-
-            kb = create_paginated_keyboard(choices, chat_id, page, 10, "search")
-            bot.edit_message_text(tr(chat_id, "pick_from_results"), call.message.chat.id, call.message.message_id, reply_markup=kb)
-
-        bot.answer_callback_query(call.id)
-    elif data.startswith("playlist_page:"):
-        page_str = data.split(":", 1)[1]
-        try:
-            page = int(page_str)
-        except Exception:
-            bot.answer_callback_query(call.id, "Invalid page")
-            return
-
-        with db_pool.get_connection() as conn:
-            c = conn.cursor()
-            c.execute("SELECT url, title, artist, duration FROM playlist_cache WHERE chat_id=? ORDER BY idx", (chat_id,))
-            rows = c.fetchall()
-
-        if rows:
-            choices = []
-            for row in rows:
-                choices.append({"url": row[0], "title": row[1], "artist": row[2], "duration": row[3]})
-
-            kb = create_paginated_keyboard(choices, chat_id, page, 10, "playlist")
-            bot.edit_message_text(tr(chat_id, "playlist_song_selection"), call.message.chat.id, call.message.message_id, reply_markup=kb)
-
-        bot.answer_callback_query(call.id)
-    elif data == "noop":
-        bot.answer_callback_query(call.id)
-
-def send_main_messages(chat_id):
-    """Send main bot messages after joining with enhanced features"""
-    send_features_message(chat_id)
-    bot.send_message(chat_id, tr(chat_id, "send_link"), reply_markup=main_menu_keyboard(chat_id))
-
-# ===== Main message handler =====
-@bot.message_handler(func=lambda m: True)
-def handle_message(message):
-    chat_id = message.chat.id
-
-    # If user hasn't selected language yet
-    if not get_user_lang(chat_id) or get_user_lang(chat_id) not in LANGS:
-        lang_keyboard = InlineKeyboardMarkup()
-        lang_keyboard.row(
-            InlineKeyboardButton(text="فارسی 🇮🇷", callback_data="start_lang:fa"),
-            InlineKeyboardButton(text="English 🇬🇧", callback_data="start_lang:en"),
+        # Get actual file size (post-conversion)
+        file_size = get_actual_file_size(filepath)
+        # Build caption with ACTUAL file size (not download size)
+        cb = CaptionBuilder(chat_id)
+        cb.add_title(track.get('name'))
+        cb.add_artist(track.get('artist'))
+        if track.get('album'):
+            cb.add_album(track['album'])
+        if track.get('duration_ms'):
+            cb.add_duration(track['duration_ms'] / 1000)
+        cb.add_size(file_size)  # ACTUAL file size
+        cb.add_platform('spotify')
+        cb.add_footer()
+        caption = cb.build()
+        # Upload
+        await pb.close(f"⬆️ {tr(chat_id, 'uploading')}")
+        # Download cover for thumbnail
+        cover_path = None
+        if track.get('cover'):
+            cover_path = download_thumb_hd(track['cover'], workdir)
+        sent = await send_audio_file(
+            chat_id, filepath,
+            title=track.get('name'), artist=track.get('artist'),
+            duration=int((track.get('duration_ms') or 0) / 1000),
+            cover_path=cover_path, caption=caption,
+            reply_to=None
         )
-
-        welcome_text = """
-🌐 خوش آمدید! / Welcome!
-
-لطفاً زبان خود را انتخاب کنید:
-Please select your language:
-
-🇮🇷 فارسی | 🇬🇧 English
-"""
-
-        bot.send_message(chat_id, welcome_text, reply_markup=lang_keyboard)
-        return
-
-    # Check membership for users who have selected language
-    if not is_member(chat_id):
-        join_keyboard = InlineKeyboardMarkup()
-        join_keyboard.row(InlineKeyboardButton(text="بشم، اومدم 👋", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"))
-
-        lang = get_user_lang(chat_id)
-        if lang == "fa":
-            msg_text = f"برای استفاده از ربات، لطفاً عضو کانال {CHANNEL_USERNAME} شوید.\n\nبعد از عضویت روی /start بزنید:"
+        if sent:
+            add_detailed_stats(chat_id, 'spotify', 'audio', file_size)
+            await pb.close(tr(chat_id, 'done') + " ✅")
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
         else:
-            msg_text = f"To use the bot, please join {CHANNEL_USERNAME}.\n\nAfter joining, press /start:"
+            await safe_edit_message(status_msg, tr(chat_id, 'err_download'))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
-        bot.send_message(chat_id, msg_text, reply_markup=join_keyboard)
+async def _spotify_download_all(chat_id: int, tracks: list, original_url: str,
+                                status_msg: Message, meta: dict = None):
+    """Download all tracks from a Spotify album/playlist sequentially."""
+    if not tracks:
+        await safe_edit_message(status_msg, tr(chat_id, 'sp_no_tracks'))
         return
-
-    text = (message.text or "").strip()
-    if not text:
-        bot.reply_to(message, tr(chat_id, "invalid_link"))
-        return
-
-    if text.startswith("http"):
-        final_url = resolve_url(text)
+    total = len(tracks)
+    workdir = tempfile.mkdtemp(prefix="spotify_all_")
+    success = 0
+    failed = 0
+    try:
+        for i, track in enumerate(tracks):
+            # Update progress
+            prog_text = (f"📥 {tr(chat_id, 'sp_downloading_all')}\n\n"
+                         f"📊 {tr(chat_id, 'sp_progress').format(done=i, total=total)}\n\n"
+                         f"🎧 <b>{track.get('name', '?')}</b>\n"
+                         f"🎤 {track.get('artist', '')}")
+            try:
+                await status_msg.edit_text(prog_text)
+            except Exception:
+                pass
+            # Download track
+            track_workdir = tempfile.mkdtemp(prefix=f"sp_track_{i}_", dir=workdir)
+            try:
+                filepath, yt_info = await download_spotify_track(track, track_workdir)
+                if not filepath:
+                    failed += 1
+                    continue
+                file_size = get_actual_file_size(filepath)
+                # Caption
+                cb = CaptionBuilder(chat_id)
+                cb.add_title(track.get('name'))
+                cb.add_artist(track.get('artist'))
+                if track.get('album'):
+                    cb.add_album(track['album'])
+                if track.get('duration_ms'):
+                    cb.add_duration(track['duration_ms'] / 1000)
+                cb.add_size(file_size)
+                cb.add_platform('spotify')
+                cb.add_footer()
+                caption = cb.build()
+                cover_path = None
+                if track.get('cover'):
+                    cover_path = download_thumb_hd(track['cover'], track_workdir)
+                sent = await send_audio_file(
+                    chat_id, filepath,
+                    title=track.get('name'), artist=track.get('artist'),
+                    duration=int((track.get('duration_ms') or 0) / 1000),
+                    cover_path=cover_path, caption=caption,
+                )
+                if sent:
+                    success += 1
+                    add_detailed_stats(chat_id, 'spotify', 'audio', file_size)
+                else:
+                    failed += 1
+                # Small delay to avoid rate limiting
+                await asyncio.sleep(0.5)
+            finally:
+                shutil.rmtree(track_workdir, ignore_errors=True)
+        # Final summary
+        summary = (f"✅ <b>{tr(chat_id, 'done')}</b>\n\n"
+                   f"📊 {tr(chat_id, 'sp_progress').format(done=success, total=total)}\n"
+                   f"❌ Failed: {failed}")
         try:
-            # Delete user message after starting download
-            bot.delete_message(chat_id, message.message_id)
-        except Exception as e:
-            print(f"Error deleting user message: {e}")
+            await status_msg.edit_text(summary)
+        except Exception:
+            await bot.send_message(chat_id, summary)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
-        if "soundcloud.com" in final_url:
-            handle_download_soundcloud(chat_id, final_url)
-        elif "spotify.com" in final_url or "spoti.fi" in final_url:
-            handle_download_spotify(chat_id, final_url)
-        elif "pinterest.com" in final_url or "pin.it" in final_url:
-            handle_download_pinterest(chat_id, final_url)
-        elif "instagram.com" in final_url or "instagr.am" in final_url:
-            handle_download_instagram(chat_id, final_url)
-        elif "youtube.com" in final_url or "youtu.be" in final_url:
-            handle_download_youtube(chat_id, final_url)
-        elif "tiktok.com" in final_url:
-            handle_download_tiktok(chat_id, final_url)
-        elif "twitter.com" in final_url or "x.com" in final_url or "t.co" in final_url:
-            handle_download_twitter(chat_id, final_url)
-        else:
-            bot.send_message(chat_id, tr(chat_id, "error", err="Unsupported link"))
-    else:
-        do_search(chat_id, text)
+async def handle_spotify_callback(call: CallbackQuery):
+    """Handle Spotify callback queries."""
+    chat_id = call.message.chat.id
+    data = call.data
+    user_id = call.from_user.id
+    msg = call.message
 
-# ===== File Senders =====
-def build_sc_caption(chat_id, item, original_url=None):
-    """Wrapper for backward compatibility"""
-    return caption_builder.build_caption(chat_id, "SoundCloud", item, original_url)
-
-def build_youtube_caption(chat_id, item, original_url=None, audio_only=False):
-    """Wrapper for backward compatibility"""
-    return caption_builder.build_caption(chat_id, "YouTube", item, original_url, audio_only=audio_only)
-
-def build_media_caption(chat_id, item, platform, original_url=None):
-    """Wrapper for backward compatibility"""
-    return caption_builder.build_caption(chat_id, platform, item, original_url)
-
-def send_sc_item(chat_id, item, original_url=None):
-    caption = build_sc_caption(chat_id, item, original_url)
-
-    # Send thumbnail first for SoundCloud (allowed platform)
-    if item.get("thumb_file"):
+    if data == "sp:cancel":
+        clear_spotify_cache(chat_id)
         try:
-            with open(item["thumb_file"], "rb") as tf:
-                bot.send_photo(chat_id, tf, caption=tr(chat_id, "cover_sent"))
+            await msg.edit_text(tr(chat_id, 'cancelled'))
         except Exception:
             pass
+        await call.answer()
+        return
 
-    safe_fp = force_audio_extension(item["filepath"])
+    if data == "sp:back":
+        # Go back to album/playlist view (re-fetch from cache)
+        # We don't have the URL here, so just show main menu
+        try:
+            await msg.edit_text(tr(chat_id, 'menu_main'), reply_markup=main_menu_keyboard(chat_id))
+        except Exception:
+            pass
+        await call.answer()
+        return
 
-    if item["size"] <= TELEGRAM_UPLOAD_LIMIT:
-        with open(safe_fp, "rb") as f:
-            kwargs = {
-                "caption": caption, "performer": item["artist"], "title": item["title"],
-                "duration": item["duration"] or None,
-            }
-            if item.get("thumb_file"):
-                try:
-                    with open(item["thumb_file"], "rb") as tf:
-                        kwargs["thumb"] = tf
-                        bot.send_audio(chat_id, f, **kwargs)
-                except Exception:
-                    bot.send_audio(chat_id, f, **kwargs)
+    if data.startswith("sppg:"):
+        # Track picker pagination
+        page = int(data.split(":")[1])
+        # Find the cached tracks — we need the URL. Use the last cached entry.
+        with db_pool.get_conn() as c:
+            r = c.execute("SELECT url FROM spotify_cache WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
+                          (chat_id,)).fetchone()
+        if not r:
+            await call.answer("Cache expired", show_alert=True)
+            return
+        cache = get_spotify_cache(chat_id, r['url'])
+        if not cache:
+            await call.answer("Cache expired", show_alert=True)
+            return
+        kb = create_spotify_track_keyboard(cache['tracks'], chat_id, page=page)
+        try:
+            await msg.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+        await call.answer()
+        return
+
+    if data.startswith("spp:"):
+        # Pick a specific track
+        idx = int(data.split(":")[1])
+        with db_pool.get_conn() as c:
+            r = c.execute("SELECT url FROM spotify_cache WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
+                          (chat_id,)).fetchone()
+        if not r:
+            await call.answer("Cache expired", show_alert=True)
+            return
+        cache = get_spotify_cache(chat_id, r['url'])
+        if not cache or idx >= len(cache['tracks']):
+            await call.answer("Invalid track", show_alert=True)
+            return
+        track = cache['tracks'][idx]
+        # Show status message
+        status = await bot.send_message(chat_id,
+            f"🔍 {tr(chat_id, 'sp_searching')}\n\n🎵 <b>{track.get('name', '?')}</b>\n🎤 {track.get('artist', '')}")
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await _spotify_download_single(chat_id, track, r['url'], status)
+        await call.answer()
+        return
+
+    if data == "sp:all":
+        # Download all tracks
+        with db_pool.get_conn() as c:
+            r = c.execute("SELECT url FROM spotify_cache WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
+                          (chat_id,)).fetchone()
+        if not r:
+            await call.answer("Cache expired", show_alert=True)
+            return
+        cache = get_spotify_cache(chat_id, r['url'])
+        if not cache or not cache.get('tracks'):
+            await call.answer("No tracks", show_alert=True)
+            return
+        try:
+            await msg.edit_text(f"📥 {tr(chat_id, 'sp_downloading_all')}")
+        except Exception:
+            pass
+        await _spotify_download_all(chat_id, cache['tracks'], r['url'], msg, cache.get('meta'))
+        await call.answer()
+        return
+
+    if data == "sp:pick:0":
+        # Show track picker page 0
+        with db_pool.get_conn() as c:
+            r = c.execute("SELECT url FROM spotify_cache WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
+                          (chat_id,)).fetchone()
+        if not r:
+            await call.answer("Cache expired", show_alert=True)
+            return
+        cache = get_spotify_cache(chat_id, r['url'])
+        if not cache or not cache.get('tracks'):
+            await call.answer("No tracks", show_alert=True)
+            return
+        kb = create_spotify_track_keyboard(cache['tracks'], chat_id, page=0)
+        try:
+            await msg.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+        await call.answer()
+        return
+
+# ============================================================
+#  Safe message editing
+# ============================================================
+
+async def safe_edit_message(msg: Message, text: str, reply_markup=None):
+    """Edit a message text safely (handles Telegram exceptions)."""
+    try:
+        await msg.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return
+        log.debug(f"edit_text failed: {e}")
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        try:
+            await msg.edit_text(text, reply_markup=reply_markup)
+        except Exception:
+            pass
+    except Exception as e:
+        log.debug(f"edit_text failed: {e}")
+
+# ============================================================
+#  SoundCloud & generic download orchestration
+# ============================================================
+
+async def handle_download_soundcloud(chat_id: int, url: str, status_msg: Message):
+    """Handle a SoundCloud URL: could be track, playlist, or album."""
+    await safe_edit_message(status_msg, f"🔍 {tr(chat_id, 'sc_searching')}")
+    quality = get_user_quality(chat_id)
+    workdir = tempfile.mkdtemp(prefix="sc_")
+    try:
+        # First extract info to see if it's a playlist
+        opts = make_sc_opts(workdir, quality=quality)
+        opts['skip_download'] = True
+        opts['noplaylist'] = False
+        info = await extract_info_async(url, opts)
+        if not info:
+            await safe_edit_message(status_msg, tr(chat_id, 'err_download'))
+            return
+        # Check if it's a playlist/album
+        if info.get('_type') == 'playlist' or 'entries' in info:
+            entries = [e for e in info.get('entries', []) if e]
+            if entries:
+                # Download all tracks in the playlist
+                await _soundcloud_download_playlist(chat_id, url, entries, status_msg, workdir, quality)
+                return
+        # Single track download
+        await _soundcloud_download_single(chat_id, url, status_msg, workdir, quality)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+async def _soundcloud_download_single(chat_id: int, url: str, status_msg: Message,
+                                      workdir: str, quality: str):
+    """Download a single SoundCloud track."""
+    pb = ProgressBar(bot, chat_id, status_msg.message_id,
+                     total=0, title=f"⬇️ {tr(chat_id, 'downloading')}",
+                     lang=get_user_lang(chat_id))
+    info, filepath, err = await download_soundcloud(
+        url, workdir, quality=quality, progress_hook=pb.make_ytdlp_hook(), max_retries=3)
+    if not filepath:
+        await safe_edit_message(status_msg, tr(chat_id, 'err_download'))
+        return
+    file_size = get_actual_file_size(filepath)
+    # Extract metadata from yt-dlp info
+    title = (info or {}).get('title') or (info or {}).get('track') or 'audio'
+    artist = (info or {}).get('uploader') or (info or {}).get('artist') or ''
+    duration = int((info or {}).get('duration', 0))
+    thumb_url = (info or {}).get('thumbnail')
+    # Embed metadata (including HD cover)
+    embed_audio_metadata(filepath, title=title, artist=artist, cover_url=thumb_url)
+    # Build caption
+    cb = CaptionBuilder(chat_id)
+    cb.add_title(title)
+    if artist:
+        cb.add_artist(artist)
+    cb.add_duration(duration)
+    cb.add_size(file_size)
+    cb.add_platform('soundcloud')
+    cb.add_footer()
+    caption = cb.build()
+    # Download HD cover for thumbnail
+    cover_path = None
+    if thumb_url:
+        cover_path = download_thumb_hd(thumb_url, workdir)
+    await pb.close(f"⬆️ {tr(chat_id, 'uploading')}")
+    sent = await send_audio_file(
+        chat_id, filepath, title=title, artist=artist, duration=duration,
+        cover_path=cover_path, caption=caption)
+    if sent:
+        add_detailed_stats(chat_id, 'soundcloud', 'audio', file_size)
+        await pb.close(tr(chat_id, 'done') + " ✅")
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+    else:
+        await safe_edit_message(status_msg, tr(chat_id, 'err_download'))
+
+async def _soundcloud_download_playlist(chat_id: int, url: str, entries: list,
+                                        status_msg: Message, workdir: str, quality: str):
+    """Download all tracks in a SoundCloud playlist/album."""
+    total = len(entries)
+    success = 0
+    failed = 0
+    try:
+        for i, entry in enumerate(entries):
+            entry_url = entry.get('url') or entry.get('webpage_url')
+            if not entry_url:
+                failed += 1
+                continue
+            prog_text = (f"📥 {tr(chat_id, 'sp_downloading_all')}\n\n"
+                         f"📊 {tr(chat_id, 'sp_progress').format(done=i, total=total)}\n\n"
+                         f"🎧 <b>{entry.get('title', '?')}</b>")
+            try:
+                await status_msg.edit_text(prog_text)
+            except Exception:
+                pass
+            track_workdir = tempfile.mkdtemp(prefix=f"sc_t_{i}_", dir=workdir)
+            try:
+                info, filepath, err = await download_soundcloud(
+                    entry_url, track_workdir, quality=quality, max_retries=2)
+                if not filepath:
+                    failed += 1
+                    continue
+                file_size = get_actual_file_size(filepath)
+                title = entry.get('title') or (info or {}).get('title') or 'audio'
+                artist = (info or {}).get('uploader') or (entry.get('uploader') or '')
+                duration = int((info or {}).get('duration', 0))
+                thumb_url = (info or {}).get('thumbnail') or entry.get('thumbnail')
+                embed_audio_metadata(filepath, title=title, artist=artist, cover_url=thumb_url)
+                cb = CaptionBuilder(chat_id)
+                cb.add_title(title)
+                if artist:
+                    cb.add_artist(artist)
+                cb.add_duration(duration)
+                cb.add_size(file_size)
+                cb.add_platform('soundcloud')
+                cb.add_footer()
+                caption = cb.build()
+                cover_path = download_thumb_hd(thumb_url, track_workdir) if thumb_url else None
+                sent = await send_audio_file(
+                    chat_id, filepath, title=title, artist=artist, duration=duration,
+                    cover_path=cover_path, caption=caption)
+                if sent:
+                    success += 1
+                    add_detailed_stats(chat_id, 'soundcloud', 'audio', file_size)
+                else:
+                    failed += 1
+                await asyncio.sleep(0.5)
+            finally:
+                shutil.rmtree(track_workdir, ignore_errors=True)
+        summary = (f"✅ <b>{tr(chat_id, 'done')}</b>\n\n"
+                   f"📊 {tr(chat_id, 'sp_progress').format(done=success, total=total)}\n"
+                   f"❌ Failed: {failed}")
+        try:
+            await status_msg.edit_text(summary)
+        except Exception:
+            await bot.send_message(chat_id, summary)
+    except Exception as e:
+        log.error(f"SoundCloud playlist download error: {e}")
+        await safe_edit_message(status_msg, tr(chat_id, 'err_download'))
+
+async def handle_download_youtube(chat_id: int, url: str, status_msg: Message):
+    """Handle a YouTube URL: extract qualities, let user pick, download."""
+    await safe_edit_message(status_msg, f"🔍 {tr(chat_id, 'progress_extracting')}")
+    # Check if it's a short
+    is_short = is_youtube_short(url)
+    # Get qualities
+    qualities = await get_youtube_qualities(url)
+    if not qualities:
+        # Cookies likely needed
+        await safe_edit_message(status_msg,
+            f"❌ {tr(chat_id, 'yt_no_formats')}\n\n"
+            f"💡 YouTube requires cookies. Please add a cookies.txt file.")
+        return
+    # Save URL for later use
+    save_youtube_qualities(chat_id, url, qualities)
+    save_youtube_shorts_info(chat_id, url, is_short)
+    # Show quality picker
+    text = tr(chat_id, 'yt_quality')
+    if is_short:
+        text = f"📱 {tr(chat_id, 'yt_shorts_detected')}\n\n{text}"
+    kb = create_youtube_quality_keyboard(qualities, chat_id)
+    await safe_edit_message(status_msg, text, reply_markup=kb)
+
+async def handle_youtube_quality_selection(call: CallbackQuery):
+    """Handle YouTube quality selection callback."""
+    chat_id = call.message.chat.id
+    data = call.data
+    msg = call.message
+    # Get the cached URL
+    with db_pool.get_conn() as c:
+        r = c.execute("SELECT url FROM youtube_quality_cache WHERE chat_id=? ORDER BY created_at DESC LIMIT 1",
+                      (chat_id,)).fetchone()
+    if not r:
+        await call.answer("Cache expired, please resend the link", show_alert=True)
+        return
+    url = r['url']
+    if data == "yt:cancel":
+        try:
+            await msg.edit_text(tr(chat_id, 'cancelled'))
+        except Exception:
+            pass
+        await call.answer()
+        return
+    audio_only = (data == "yt:audio")
+    format_id = None if audio_only else data.split(":", 1)[1]
+    await call.answer()
+    try:
+        await msg.edit_text(f"⬇️ {tr(chat_id, 'downloading')}")
+    except Exception:
+        pass
+    workdir = tempfile.mkdtemp(prefix="yt_")
+    try:
+        pb = ProgressBar(bot, chat_id, msg.message_id,
+                         total=0, title=f"⬇️ {tr(chat_id, 'downloading')}",
+                         lang=get_user_lang(chat_id))
+        info, filepath, err = await download_youtube(
+            url, workdir, format_id=format_id, audio_only=audio_only,
+            progress_hook=pb.make_ytdlp_hook())
+        if not filepath:
+            err_msg = tr(chat_id, 'err_download')
+            if err and ('cookie' in err.lower() or 'sign in' in err.lower()):
+                err_msg = "❌ YouTube requires cookies. Please add a cookies.txt file."
+            await safe_edit_message(msg, err_msg)
+            return
+        file_size = get_actual_file_size(filepath)
+        if file_size > TELEGRAM_UPLOAD_LIMIT:
+            await safe_edit_message(msg, tr(chat_id, 'err_too_large'))
+            return
+        title = (info or {}).get('title') or 'video'
+        artist = (info or {}).get('uploader') or (info or {}).get('channel') or ''
+        duration = int((info or {}).get('duration', 0))
+        thumb_url = (info or {}).get('thumbnail')
+        width = (info or {}).get('width')
+        height = (info or {}).get('height')
+        # Build caption
+        cb = CaptionBuilder(chat_id)
+        cb.add_title(title)
+        if artist:
+            cb.add_artist(artist)
+        cb.add_duration(duration)
+        cb.add_size(file_size)
+        cb.add_platform('youtube')
+        cb.add_footer()
+        caption = cb.build()
+        cover_path = None
+        if thumb_url:
+            cover_path = download_thumb_hd(thumb_url, workdir)
+        await pb.close(f"⬆️ {tr(chat_id, 'uploading')}")
+        if audio_only:
+            # Embed metadata
+            embed_audio_metadata(filepath, title=title, artist=artist, cover_url=thumb_url)
+            sent = await send_audio_file(
+                chat_id, filepath, title=title, artist=artist, duration=duration,
+                cover_path=cover_path, caption=caption)
+            if sent:
+                add_detailed_stats(chat_id, 'youtube', 'audio', file_size)
+        else:
+            sent = await send_video_file(
+                chat_id, filepath, caption=caption, duration=duration,
+                width=width, height=height, cover_path=cover_path)
+            if sent:
+                add_detailed_stats(chat_id, 'youtube', 'video', file_size)
+        if sent:
+            await pb.close(tr(chat_id, 'done') + " ✅")
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        else:
+            await safe_edit_message(msg, tr(chat_id, 'err_download'))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+async def handle_generic_download(chat_id: int, url: str, platform: str, status_msg: Message):
+    """Handle a generic platform download (Pinterest, Instagram, TikTok, Twitter)."""
+    await safe_edit_message(status_msg, f"⬇️ {tr(chat_id, 'downloading')}")
+    # Resolve short URLs
+    resolved = await resolve_url_async(url)
+    workdir = tempfile.mkdtemp(prefix=f"{platform}_")
+    try:
+        pb = ProgressBar(bot, chat_id, status_msg.message_id,
+                         total=0, title=f"⬇️ {tr(chat_id, 'downloading')}",
+                         lang=get_user_lang(chat_id))
+        info, filepath, err = await download_generic(
+            resolved, workdir, platform=platform, progress_hook=pb.make_ytdlp_hook())
+        if not filepath:
+            if err == 'no_video':
+                await safe_edit_message(status_msg, tr(chat_id, 'err_no_video'))
+            elif err == 'private':
+                await safe_edit_message(status_msg, tr(chat_id, 'err_private'))
             else:
-                bot.send_audio(chat_id, f, **kwargs)
-        add_stats_with_platform(chat_id, "SoundCloud", "audio", item["size"])
+                await safe_edit_message(status_msg, tr(chat_id, 'err_download'))
+            return
+        file_size = get_actual_file_size(filepath)
+        if file_size > TELEGRAM_UPLOAD_LIMIT:
+            await safe_edit_message(status_msg, tr(chat_id, 'err_too_large'))
+            return
+        title = (info or {}).get('title') or f'{platform}_video'
+        artist = (info or {}).get('uploader') or (info or {}).get('channel') or (info or {}).get('author') or ''
+        duration = int((info or {}).get('duration', 0))
+        thumb_url = (info or {}).get('thumbnail')
+        width = (info or {}).get('width')
+        height = (info or {}).get('height')
+        # Determine if audio or video
+        is_audio = filepath.lower().endswith(('.mp3', '.m4a', '.opus', '.ogg', '.flac', '.wav'))
+        cb = CaptionBuilder(chat_id)
+        cb.add_title(title)
+        if artist:
+            cb.add_artist(artist)
+        cb.add_duration(duration)
+        cb.add_size(file_size)
+        cb.add_platform(platform)
+        cb.add_footer()
+        caption = cb.build()
+        cover_path = None
+        if thumb_url:
+            cover_path = download_thumb_hd(thumb_url, workdir)
+        await pb.close(f"⬆️ {tr(chat_id, 'uploading')}")
+        if is_audio:
+            sent = await send_audio_file(
+                chat_id, filepath, title=title, artist=artist, duration=duration,
+                cover_path=cover_path, caption=caption)
+            if sent:
+                add_detailed_stats(chat_id, platform, 'audio', file_size)
+        else:
+            sent = await send_video_file(
+                chat_id, filepath, caption=caption, duration=duration,
+                width=width, height=height, cover_path=cover_path)
+            if sent:
+                add_detailed_stats(chat_id, platform, 'video', file_size)
+        if sent:
+            await pb.close(tr(chat_id, 'done') + " ✅")
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        else:
+            await safe_edit_message(status_msg, tr(chat_id, 'err_download'))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+async def do_search(chat_id: int, query: str):
+    """Search SoundCloud for a query and show results."""
+    status = await bot.send_message(chat_id, f"🔍 {tr(chat_id, 'sc_searching')}")
+    workdir = tempfile.mkdtemp(prefix="scsearch_")
+    try:
+        search_url = f"scsearch15:{query}"
+        opts = make_sc_opts(workdir, quality=get_user_quality(chat_id))
+        opts['skip_download'] = True
+        opts['extract_flat'] = True
+        info = await extract_info_async(search_url, opts)
+        if not info or not info.get('entries'):
+            await safe_edit_message(status, tr(chat_id, 'sc_no_results'))
+            return
+        entries = [e for e in info['entries'] if e][:15]
+        if not entries:
+            await safe_edit_message(status, tr(chat_id, 'sc_no_results'))
+            return
+        save_search_choices(chat_id, entries)
+        kb = create_paginated_keyboard(entries, chat_id, page=0, prefix="search")
+        text = f"🔍 {tr(chat_id, 'sc_search_results')} ({len(entries)})\n\n{tr(chat_id, 'sc_pick_track')}"
+        await safe_edit_message(status, text, reply_markup=kb)
+    except Exception as e:
+        log.error(f"Search error: {e}")
+        await safe_edit_message(status, tr(chat_id, 'err_download'))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+# ============================================================
+#  Stats display
+# ============================================================
+
+def build_stats_text(chat_id: int, period: str = 'all') -> str:
+    """Build stats text for a user."""
+    lang = get_user_lang(chat_id)
+    stats = get_stats(chat_id)
+    platform_stats = get_user_platform_stats(chat_id, period=period)
+    cb = CaptionBuilder(chat_id)
+    cb.lines.append(f"📊 <b>{tr(chat_id, 'stats_title')}</b>")
+    if period == 'daily':
+        cb.lines.append(f"📅 {tr(chat_id, 'stats_period_daily')}")
+    elif period == 'weekly':
+        cb.lines.append(f"📅 {tr(chat_id, 'stats_period_weekly')}")
     else:
-        bot.send_message(chat_id, tr(chat_id, "error", err=f"File too large: {human_size(item['size'])}"))
+        cb.lines.append(f"📅 {tr(chat_id, 'stats_period_all')}")
+    cb.add_separator()
+    if not stats['total_count']:
+        cb.lines.append(tr(chat_id, 'stats_no_data'))
+        return cb.build()
+    cb.lines.append(f"📥 {tr(chat_id, 'stats_total')}: <b>{stats['total_count']}</b>")
+    cb.lines.append(f"💾 {tr(chat_id, 'stats_total_size')}: <b>{human_size(stats['total_size'])}</b>")
+    if platform_stats:
+        cb.lines.append("")
+        cb.lines.append(f"📈 {tr(chat_id, 'stats_by_platform')}:")
+        for ps in platform_stats:
+            platform_name = {
+                'spotify': '🎧 Spotify', 'soundcloud': '☁️ SoundCloud',
+                'youtube': '📺 YouTube', 'pinterest': '📌 Pinterest',
+                'instagram': '📸 Instagram', 'tiktok': '🎵 TikTok',
+                'twitter': '🐦 Twitter',
+            }.get(ps['platform'], ps['platform'])
+            cb.lines.append(f"  {platform_name}: {ps['n']} ({human_size(ps['s'])})")
+    return cb.build()
 
-def send_youtube_item(chat_id, item, original_url=None, audio_only=False):
-    caption = build_youtube_caption(chat_id, item, original_url, audio_only)
+# ============================================================
+#  Message handlers
+# ============================================================
 
-    # Send thumbnail first for YouTube regular videos (allowed platform)
-    if item.get("thumb_file") and not audio_only:
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    chat_id = message.chat.id
+    ensure_user(chat_id, message.from_user.username, message.from_user.first_name)
+    # Check channel membership
+    if not await is_member(chat_id):
+        await message.answer(tr(chat_id, 'must_join'), reply_markup=join_keyboard(chat_id))
+        return
+    name = message.from_user.first_name or "friend"
+    text = tr(chat_id, 'welcome').format(bot_name=BOT_USERNAME)
+    text += "\n\n" + tr(chat_id, 'features_lines')
+    await message.answer(text, reply_markup=main_menu_keyboard(chat_id))
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    chat_id = message.chat.id
+    if not await is_member(chat_id):
+        await message.answer(tr(chat_id, 'must_join'), reply_markup=join_keyboard(chat_id))
+        return
+    await message.answer(tr(chat_id, 'help_text'), reply_markup=main_menu_keyboard(chat_id))
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message):
+    chat_id = message.chat.id
+    if not await is_member(chat_id):
+        await message.answer(tr(chat_id, 'must_join'), reply_markup=join_keyboard(chat_id))
+        return
+    await message.answer(tr(chat_id, 'menu_main'), reply_markup=main_menu_keyboard(chat_id))
+
+@router.message(Command("lang"))
+async def cmd_lang(message: Message):
+    chat_id = message.chat.id
+    lang = get_user_lang(chat_id)
+    await message.answer(tr(chat_id, 'lang_current').format(lang=lang), reply_markup=lang_keyboard())
+
+@router.message(Command("quality"))
+async def cmd_quality(message: Message):
+    chat_id = message.chat.id
+    q = get_user_quality(chat_id)
+    qmap = {'high': 'High 320kbps', 'medium': 'Medium 128kbps', 'low': 'Low 64kbps'}
+    await message.answer(tr(chat_id, 'quality_current').format(quality=qmap.get(q, q)),
+                         reply_markup=sc_quality_keyboard(chat_id))
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    chat_id = message.chat.id
+    text = build_stats_text(chat_id, 'all')
+    await message.answer(text, reply_markup=stats_keyboard(chat_id))
+
+@router.message(Command("search"))
+async def cmd_search(message: Message):
+    chat_id = message.chat.id
+    if not await is_member(chat_id):
+        await message.answer(tr(chat_id, 'must_join'), reply_markup=join_keyboard(chat_id))
+        return
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        await message.answer(tr(chat_id, 'search_prompt'))
+        return
+    query = args[1].strip()
+    await do_search(chat_id, query)
+
+@router.callback_query(F.data == "check:join")
+async def cb_check_join(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    if await is_member(chat_id):
+        await call.answer(tr(chat_id, 'joined_check'), show_alert=True)
+        name = call.from_user.first_name or "friend"
+        text = tr(chat_id, 'welcome').format(bot_name=BOT_USERNAME)
+        text += "\n\n" + tr(chat_id, 'features_lines')
         try:
-            with open(item["thumb_file"], "rb") as tf:
-                bot.send_photo(chat_id, tf, caption=tr(chat_id, "youtube_preview"))
+            await call.message.edit_text(text, reply_markup=main_menu_keyboard(chat_id))
+        except Exception:
+            await call.message.answer(text, reply_markup=main_menu_keyboard(chat_id))
+    else:
+        await call.answer("❌ You haven't joined yet!", show_alert=True)
+
+@router.callback_query(F.data.startswith("lang:"))
+async def cb_lang(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    lang = call.data.split(":")[1]
+    set_user_lang(chat_id, lang)
+    lang_names = {'fa': 'فارسی', 'en': 'English'}
+    await call.answer(f"✅ {lang_names.get(lang, lang)}", show_alert=False)
+    await call.message.edit_text(tr(chat_id, 'lang_current').format(lang=lang_names.get(lang, lang)),
+                                reply_markup=lang_keyboard())
+
+@router.callback_query(F.data.startswith("scq:"))
+async def cb_sc_quality(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    q = call.data.split(":")[1]
+    set_user_quality(chat_id, q)
+    qmap = {'high': 'High 320kbps', 'medium': 'Medium 128kbps', 'low': 'Low 64kbps'}
+    await call.answer(tr(chat_id, 'quality_set').format(quality=qmap.get(q, q)))
+    await call.message.edit_text(tr(chat_id, 'quality_current').format(quality=qmap.get(q, q)),
+                                reply_markup=main_menu_keyboard(chat_id))
+
+@router.callback_query(F.data.startswith("menu:"))
+async def cb_menu(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    action = call.data.split(":")[1]
+    await call.answer()
+    if action == "main":
+        await call.message.edit_text(tr(chat_id, 'menu_main'), reply_markup=main_menu_keyboard(chat_id))
+    elif action == "quality":
+        q = get_user_quality(chat_id)
+        qmap = {'high': 'High 320kbps', 'medium': 'Medium 128kbps', 'low': 'Low 64kbps'}
+        await call.message.edit_text(tr(chat_id, 'quality_current').format(quality=qmap.get(q, q)),
+                                    reply_markup=sc_quality_keyboard(chat_id))
+    elif action == "language":
+        lang = get_user_lang(chat_id)
+        await call.message.edit_text(tr(chat_id, 'lang_current').format(lang=lang),
+                                    reply_markup=lang_keyboard())
+    elif action == "stats":
+        text = build_stats_text(chat_id, 'all')
+        await call.message.edit_text(text, reply_markup=stats_keyboard(chat_id))
+    elif action == "help":
+        await call.message.edit_text(tr(chat_id, 'help_text'), reply_markup=main_menu_keyboard(chat_id))
+    elif action == "search":
+        await call.message.edit_text(tr(chat_id, 'search_prompt'))
+
+@router.callback_query(F.data.startswith("stat:"))
+async def cb_stat(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    period = call.data.split(":")[1]
+    await call.answer()
+    text = build_stats_text(chat_id, period)
+    try:
+        await call.message.edit_text(text, reply_markup=stats_keyboard(chat_id))
+    except Exception:
+        # If text is the same, just ignore
+        pass
+
+@router.callback_query(F.data.startswith("sp:"))
+async def cb_spotify(call: CallbackQuery):
+    await handle_spotify_callback(call)
+
+@router.callback_query(F.data.startswith("spp"))
+async def cb_spotify_pick(call: CallbackQuery):
+    await handle_spotify_callback(call)
+
+@router.callback_query(F.data.startswith("yt:"))
+async def cb_youtube(call: CallbackQuery):
+    await handle_youtube_quality_selection(call)
+
+@router.callback_query(F.data.startswith("ytv:"))
+async def cb_youtube_video(call: CallbackQuery):
+    await handle_youtube_quality_selection(call)
+
+@router.callback_query(F.data.startswith("search:"))
+async def cb_search_pick(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    data = call.data
+    msg = call.message
+    if data == "search:cancel":
+        try:
+            await msg.edit_text(tr(chat_id, 'cancelled'))
         except Exception:
             pass
-
-    if item["size"] <= TELEGRAM_UPLOAD_LIMIT:
-        if audio_only:
-            # Send as audio file
-            with open(item["filepath"], "rb") as f:
-                kwargs = {
-                    "caption": caption,
-                    "title": item["title"],
-                    "duration": item["duration"] or None,
-                }
-                if item.get("thumb_file"):
-                    try:
-                        with open(item["thumb_file"], "rb") as tf:
-                            kwargs["thumb"] = tf
-                            bot.send_audio(chat_id, f, **kwargs)
-                    except Exception:
-                        bot.send_audio(chat_id, f, **kwargs)
-                else:
-                    bot.send_audio(chat_id, f, **kwargs)
-            add_stats_with_platform(chat_id, "YouTube", "audio", item["size"])
-        else:
-            # Send as video file
-            with open(item["filepath"], "rb") as f:
-                kwargs = {
-                    "caption": caption,
-                    "duration": item.get("duration") or None,
-                    "supports_streaming": True,
-                }
-                if item.get("thumb_file"):
-                    try:
-                        with open(item["thumb_file"], "rb") as tf:
-                            kwargs["thumb"] = tf
-                            bot.send_video(chat_id, f, **kwargs)
-                    except Exception:
-                        bot.send_video(chat_id, f, **kwargs)
-                else:
-                    bot.send_video(chat_id, f, **kwargs)
-            add_stats_with_platform(chat_id, "YouTube", "video", item["size"])
-    else:
-        bot.send_message(chat_id, tr(chat_id, "error", err=f"File too large: {human_size(item['size'])}"))
-
-def send_youtube_short_item(chat_id, item, original_url=None, audio_only=False):
-    """Send YouTube Short WITHOUT thumbnail"""
-    caption = build_youtube_caption(chat_id, item, original_url, audio_only)
-
-    # NO thumbnail for YouTube Shorts
-    if item["size"] <= TELEGRAM_UPLOAD_LIMIT:
-        if audio_only:
-            # Send as audio file
-            with open(item["filepath"], "rb") as f:
-                kwargs = {
-                    "caption": caption,
-                    "title": item["title"],
-                    "duration": item["duration"] or None,
-                }
-                bot.send_audio(chat_id, f, **kwargs)
-            add_stats_with_platform(chat_id, "YouTube", "audio", item["size"])
-        else:
-            # Send as video file WITHOUT thumbnail
-            with open(item["filepath"], "rb") as f:
-                kwargs = {
-                    "caption": caption,
-                    "duration": item.get("duration") or None,
-                    "supports_streaming": True,
-                }
-                bot.send_video(chat_id, f, **kwargs)
-            add_stats_with_platform(chat_id, "YouTube", "video", item["size"])
-    else:
-        bot.send_message(chat_id, tr(chat_id, "error", err=f"File too large: {human_size(item['size'])}"))
-
-def send_media_item(chat_id, item, platform, original_url=None):
-    caption = build_media_caption(chat_id, item, platform, original_url)
-    ext = (item.get("ext") or "").lower()
-    size = item.get("size", 0)
-
-    if size > TELEGRAM_UPLOAD_LIMIT:
-        bot.send_message(chat_id, tr(chat_id, "error", err=f"File too large: {human_size(size)}"))
+        await call.answer()
         return
-
-    # NO thumbnail sending for non-allowed platforms (Pinterest, Instagram, TikTok, Twitter)
-    # Only YouTube and SoundCloud are allowed to send thumbnails
-
-    if ext in ["jpg", "jpeg", "png", "webp"]:
+    if data.startswith("searchpg:"):
+        page = int(data.split(":")[1])
+        with db_pool.get_conn() as c:
+            # Get all saved choices for this user (we saved 15)
+            rows = c.execute("SELECT idx, choice_json FROM search_choices WHERE chat_id=? ORDER BY idx",
+                            (chat_id,)).fetchall()
+        choices = [json.loads(r['choice_json']) for r in rows]
+        kb = create_paginated_keyboard(choices, chat_id, page=page, prefix="search")
         try:
-            with open(item["filepath"], "rb") as f:
-                bot.send_photo(chat_id, f, caption=caption)
-        except Exception as e:
-            bot.send_message(chat_id, tr(chat_id, "error", err=str(e)))
-        add_stats_with_platform(chat_id, platform, "image", size)
-    else:
-        # Ensure video has .mp4 extension
-        video_path = force_video_extension(item["filepath"])
-        
-        # Video
+            await msg.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+        await call.answer()
+        return
+    if data.startswith("search:"):
+        idx = int(data.split(":")[1])
+        choice = get_search_choice(chat_id, idx)
+        if not choice:
+            await call.answer("Choice expired", show_alert=True)
+            return
+        await call.answer()
+        url = choice.get('url') or choice.get('webpage_url')
+        if not url:
+            await msg.edit_text(tr(chat_id, 'err_invalid_url'))
+            return
+        await msg.edit_text(f"⬇️ {tr(chat_id, 'downloading')}")
+        workdir = tempfile.mkdtemp(prefix="sc_pick_")
         try:
-            with open(video_path, "rb") as f:
-                kwargs = {
-                    "caption": caption, 
-                    "duration": item.get("duration") or None, 
-                    "supports_streaming": True,
-                }
-                bot.send_video(chat_id, f, **kwargs)
-        except Exception as e:
-            bot.send_message(chat_id, tr(chat_id, "error", err=str(e)))
-        add_stats_with_platform(chat_id, platform, "video", size)
+            await _soundcloud_download_single(chat_id, url, msg, workdir, get_user_quality(chat_id))
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
-# ===== Flask Web Server for Replit =====
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "🤖 Enhanced Telegram Bot is Running!"
-
-@app.route('/health')
-def health():
-    return {"status": "healthy", "timestamp": time.time(), "service": "Enhanced Telegram Downloader Bot", "version": "3.1"}
-
-@app.route('/ping')
-def ping():
-    return "pong - {}".format(time.strftime('%Y-%m-%d %H:%M:%S'))
-
-@app.route('/status')
-def status():
-    import datetime
-    return {"status": "running", "service": "Enhanced Telegram Downloader Bot", "timestamp": datetime.datetime.now().isoformat(), "platform": "Replit", "uptime": "active"}
-
-@app.route('/keepalive')
-def keepalive():
-    return {"status": "alive", "time": time.time()}
-
-# ===== Replit Keep-Alive System =====
-def setup_replit_keepalive():
-    """Complete Replit keeper setup"""
+@router.callback_query(F.data == "cancel:op")
+async def cb_cancel(call: CallbackQuery):
+    chat_id = call.message.chat.id
     try:
-        print("Setting up Replit keep-alive system...")
+        await call.message.edit_text(tr(chat_id, 'cancelled'))
+    except Exception:
+        pass
+    await call.answer()
 
-        def replit_pinger():
-            import requests
-            import time
-
-            print("Waiting for Flask server to start...")
-            time.sleep(10)
-
-            base_urls = [f"http://localhost:{PORT}", "http://localhost:5000"]
-            endpoints = ['/', '/health', '/ping', '/status', '/keepalive']
-            ping_count = 0
-
-            while True:
-                ping_count += 1
-                success_count = 0
-
-                for base_url in base_urls:
-                    current_success = 0
-                    print(f"Ping #{ping_count} with address: {base_url}")
-
-                    for endpoint in endpoints:
-                        try:
-                            url = f"{base_url}{endpoint}"
-                            response = requests.get(url, timeout=10)
-                            if response.status_code == 200:
-                                current_success += 1
-                                success_count += 1
-                                print(f"Ping #{ping_count} to {endpoint} successful")
-                            else:
-                                print(f"Ping #{ping_count} to {endpoint} with status: {response.status_code}")
-                        except requests.exceptions.ConnectionError as e:
-                            print(f"Connection error in ping #{ping_count} to {endpoint}: {e}")
-                            break
-                        except Exception as e:
-                            print(f"Error in ping #{ping_count} to {endpoint}: {e}")
-
-                    if current_success > 0:
-                        break
-
-                print(f"Ping #{ping_count}: {success_count}/{len(endpoints)} successful")
-
-                sleep_time = 30 + (ping_count % 4) * 60
-                print(f"Sleeping for {sleep_time} seconds...")
-                time.sleep(sleep_time)
-
-        pinger_thread = threading.Thread(target=replit_pinger, daemon=True)
-        pinger_thread.start()
-        print("Replit keep-alive system started")
-
+@router.message(F.text)
+async def handle_message(message: Message):
+    """Handle text messages — detect URLs and route to appropriate handler."""
+    chat_id = message.chat.id
+    ensure_user(chat_id, message.from_user.username, message.from_user.first_name)
+    # Check channel membership
+    if not await is_member(chat_id):
+        await message.answer(tr(chat_id, 'must_join'), reply_markup=join_keyboard(chat_id))
+        return
+    text = (message.text or '').strip()
+    # If it's a command we don't handle, ignore
+    if text.startswith('/'):
+        return
+    # Check if it's a URL
+    url_match = re.search(r'https?://[^\s]+', text)
+    if not url_match:
+        # Maybe it's a search query for SoundCloud? Only if short text.
+        if len(text) < 200 and not any(c in text for c in '\n'):
+            # Treat as SoundCloud search
+            await do_search(chat_id, text)
+            return
+        await message.answer(tr(chat_id, 'send_link'))
+        return
+    url = url_match.group(0)
+    platform = detect_platform_from_url(url)
+    if platform == 'unknown':
+        await message.answer(tr(chat_id, 'err_not_supported'))
+        return
+    # Create a status message
+    status = await message.answer(f"⏳ {tr(chat_id, 'processing')}")
+    try:
+        if platform == 'spotify':
+            await handle_download_spotify(chat_id, url, status)
+        elif platform == 'soundcloud':
+            await handle_download_soundcloud(chat_id, url, status)
+        elif platform == 'youtube':
+            await handle_download_youtube(chat_id, url, status)
+        elif platform in ('pinterest', 'instagram', 'tiktok', 'twitter'):
+            await handle_generic_download(chat_id, url, platform, status)
+        else:
+            await safe_edit_message(status, tr(chat_id, 'err_not_supported'))
     except Exception as e:
-        print(f"Error setting up keep-alive: {e}")
+        log.error(f"Download handler error: {e}", exc_info=True)
+        await safe_edit_message(status, tr(chat_id, 'err_download'))
 
-def setup_uptimerobot_keepalive():
-    """Simple system for UptimeRobot"""
-    def simple_pinger():
-        import time
-        print("Waiting for Flask server to start for pulse...")
-        time.sleep(10)
+# ============================================================
+#  Keepalive (aiohttp web server)
+# ============================================================
 
-        ping_count = 0
-        while True:
-            ping_count += 1
-            print(f"Bot active - Pulse #{ping_count} - Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            time.sleep(30)
+async def health_handler(request: web.Request) -> web.Response:
+    return web.Response(text="OK", status=200)
 
-    pinger_thread = threading.Thread(target=simple_pinger, daemon=True)
-    pinger_thread.start()
-    print("Simple pulse system started")
+async def ping_handler(request: web.Request) -> web.Response:
+    return web.Response(text="pong", status=200)
 
-# ===== Main Entry Point =====
+async def status_handler(request: web.Request) -> web.Response:
+    stats = get_uptime_stats()
+    return web.json_response({
+        'status': 'ok',
+        'bot': BOT_USERNAME,
+        'uptime_stats': stats,
+        'spotapi': SPOTAPI_AVAILABLE,
+        'mutagen': MUTAGEN_AVAILABLE,
+        'cookies': COOKIES_AVAILABLE,
+    })
+
+async def root_handler(request: web.Request) -> web.Response:
+    html = """<!DOCTYPE html>
+<html><head><meta charset='utf-8'><title>Aurora Downloader Bot</title>
+<style>body{font-family:system-ui;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}.card{background:rgba(255,255,255,0.1);backdrop-filter:blur(10px);padding:40px;border-radius:20px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.2)}h1{margin:0 0 10px;font-size:2.5em}p{opacity:0.9;margin:5px 0}</style>
+</head><body><div class='card'><h1>🌟 Aurora</h1><p>Downloader Bot is running</p><p>Supports: SoundCloud · Spotify · YouTube · Pinterest · Instagram · TikTok · Twitter</p></div></body></html>"""
+    return web.Response(text=html, content_type='text/html')
+
+def setup_keepalive():
+    """Setup aiohttp keepalive web server."""
+    app = web.Application()
+    app.router.add_get('/', root_handler)
+    app.router.add_get('/health', health_handler)
+    app.router.add_get('/ping', ping_handler)
+    app.router.add_get('/status', status_handler)
+    return app
+
+# ============================================================
+#  Main
+# ============================================================
+
+async def on_startup():
+    """Called when the bot starts."""
+    await _fetch_bot_username()
+    log.info("=" * 50)
+    log.info(f"  Aurora Downloader Bot v5.0 (aiogram 3.x)")
+    log.info(f"  Bot: @{BOT_USERNAME}")
+    log.info(f"  Channel: {CHANNEL_USERNAME}")
+    log.info(f"  Cookies: {'available' if COOKIES_AVAILABLE else 'not found'}")
+    log.info(f"  spotapi: {'available' if SPOTAPI_AVAILABLE else 'NOT available'}")
+    log.info(f"  mutagen: {'available' if MUTAGEN_AVAILABLE else 'NOT available'}")
+    log.info(f"  Keepalive: http://0.0.0.0:{PORT}")
+    log.info("=" * 50)
+
+async def main():
+    await on_startup()
+    # Start keepalive server in background
+    app = setup_keepalive()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    log.info(f"Keepalive server started on port {PORT}")
+    # Start polling (this blocks)
+    try:
+        await dp.start_polling(bot, polling_timeout=60)
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
+
 if __name__ == '__main__':
-    print("=" * 60)
-    print("  Enhanced Telegram Downloader Bot  v4.1")
-    print("  Platforms: SoundCloud | Spotify | YouTube | Pinterest")
-    print("             Instagram | TikTok | Twitter (X)")
-    print(f"  Port: {PORT} | Cookies: {COOKIES_AVAILABLE}")
-    print(f"  Spotify: {'public mode (spotapi - no API keys needed)' if SPOTAPI_AVAILABLE else 'oEmbed fallback mode'}")
-    print(f"  Bot username: @{BOT_USERNAME}")
-    print("=" * 60)
-    print(f"Local URL: http://localhost:{PORT}")
-    print(f"Health check: http://localhost:{PORT}/health")
-
-    def run_flask():
-        app.run(host='0.0.0.0', port=PORT, debug=False)
-
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
-    print("Waiting for Flask server to start...")
-    time.sleep(5)
-
-    setup_replit_keepalive()
-    setup_uptimerobot_keepalive()
-
-    print("Starting Enhanced Telegram Bot...")
-    db_init()
-
     try:
-        bot.polling(none_stop=True, timeout=60)
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Bot stopped by user")
     except Exception as e:
-        print(f"Bot error: {e}")
-        import time
-        time.sleep(10)
-else:
-    # For WSGI servers like Gunicorn
-    db_init()
-    def run_bot():
-        try:
-            bot.polling(none_stop=True, timeout=60)
-        except Exception as e:
-            print(f"Bot error: {e}")
+        log.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
 
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+# ============================================================
+#  END OF FILE
+# ============================================================
