@@ -1,5 +1,5 @@
 # ============================================================
-#  Enhanced Telegram Downloader Bot  v4.0
+#  Enhanced Telegram Downloader Bot  v4.1
 #  Platforms: SoundCloud | Spotify | YouTube | Pinterest |
 #             Instagram | TikTok | Twitter (X)
 #
@@ -7,6 +7,8 @@
 #   - Multi-platform download with best quality
 #   - Colorful, polished inline keyboards
 #   - Spotify: single tracks, albums & full playlists
+#       (uses spotapi - NO API keys, NO login required!)
+#       "Download All" button downloads every track in an album/playlist
 #   - Live progress bars, detailed statistics
 #   - Smart proxy rotation for geo-restricted content
 #   - Bilingual UI (Persian / English)
@@ -35,15 +37,19 @@ import json
 import queue
 from contextlib import contextmanager
 
-# ===== Spotify (optional) =====
-# spotipy provides richer metadata. If unavailable, the bot still works
-# using the public oEmbed endpoint + YouTube search fallback.
+# ===== Spotify (public, no API keys needed) =====
+# spotapi simulates browser requests to Spotify's public web API.
+# It does NOT require a Client ID/Secret, does NOT need login, and
+# works for all PUBLIC tracks, albums and playlists without limits.
+# If unavailable, the bot falls back to the public oEmbed endpoint.
 try:
-    import spotipy
-    from spotipy.oauth2 import SpotifyClientCredentials
-    SPOTIPY_AVAILABLE = True
-except Exception:
-    SPOTIPY_AVAILABLE = False
+    from spotapi import Public as SpotapiPublic
+    from spotapi import PublicAlbum as SpotapiPublicAlbum
+    from spotapi import PublicPlaylist as SpotapiPublicPlaylist
+    SPOTAPI_AVAILABLE = True
+except Exception as e:
+    print(f"spotapi not available (will use oEmbed fallback): {e}")
+    SPOTAPI_AVAILABLE = False
 
 # ===== Config =====
 BOT_TOKEN = "8382981392:AAEdQptMng0Zu2keWRMrfylq6wepvmULCbI"
@@ -57,9 +63,8 @@ COMPANION_ID = "@Theirodentv"
 PORT = int(os.environ.get('PORT', 5000))
 COOKIES_PATH = "cookies.txt"
 
-# Spotify credentials (optional - falls back to public mode if missing)
-SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
-SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+# Spotify: NO credentials needed! spotapi uses Spotify's public web API
+# by simulating browser requests. Works for all public tracks/albums/playlists.
 
 # Check if cookies file exists
 COOKIES_AVAILABLE = os.path.exists(COOKIES_PATH)
@@ -92,28 +97,6 @@ except Exception as e:
 apihelper.SESSION_TIMEOUT = 60
 apihelper.READ_TIMEOUT = 60
 apihelper.CONNECT_TIMEOUT = 60
-
-# ===== Spotify client (lazy, optional) =====
-_spotify_client = None
-
-def get_spotify_client():
-    """Return an authenticated Spotify client if credentials are configured."""
-    global _spotify_client
-    if not SPOTIPY_AVAILABLE:
-        return None
-    if _spotify_client is None and SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
-        try:
-            auth_manager = SpotifyClientCredentials(
-                client_id=SPOTIFY_CLIENT_ID,
-                client_secret=SPOTIFY_CLIENT_SECRET,
-            )
-            _spotify_client = spotipy.Spotify(auth_manager=auth_manager)
-            # Force a token fetch to validate credentials early
-            _spotify_client.search("test", limit=1)
-        except Exception as e:
-            print(f"Spotify client init failed, will use public mode: {e}")
-            _spotify_client = None
-    return _spotify_client
 
 # ===== Connection Pool Implementation =====
 class ConnectionPool:
@@ -2704,8 +2687,9 @@ def download_soundcloud(url_or_query: str, workdir: str, quality: str, is_search
 #   3. Search & download the matching audio from YouTube via yt-dlp
 #   4. Tag the file with Spotify metadata (artist, title, album, cover)
 #
-# We use spotipy if credentials are configured for rich metadata;
-# otherwise we fall back to the public Spotify oEmbed endpoint.
+# We use spotapi (public, NO API keys, NO login) for rich metadata;
+# it simulates browser requests to Spotify's public web API.
+# If spotapi is unavailable we fall back to the public oEmbed endpoint.
 # ============================================================
 
 # Spotify URL patterns
@@ -2741,7 +2725,8 @@ def _format_duration_ms(ms):
 
 
 def _spotify_oembed(url):
-    """Public oEmbed fallback - works without credentials, returns limited metadata."""
+    """Public oEmbed fallback - works without credentials, returns limited metadata.
+    Used only when spotapi is unavailable or fails."""
     try:
         r = requests.get(
             "https://open.spotify.com/oembed",
@@ -2756,12 +2741,72 @@ def _spotify_oembed(url):
     return None
 
 
+def _best_spotify_image(sources):
+    """Pick the largest image URL from a Spotify 'sources' list.
+    Spotify returns sources sorted small -> large; we pick the largest by height."""
+    if not sources:
+        return None
+    best_url = None
+    best_h = -1
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        h = s.get("height") or 0
+        if h and h > best_h:
+            best_h = h
+            best_url = s.get("url")
+    return best_url or (sources[0].get("url") if isinstance(sources[0], dict) else None)
+
+
+def _uri_to_url(uri):
+    """Convert a 'spotify:track:ID' URI to an https open.spotify.com URL."""
+    if not uri:
+        return ""
+    m = re.match(r'spotify:track:([a-zA-Z0-9]+)', uri)
+    if m:
+        return f"https://open.spotify.com/track/{m.group(1)}"
+    return ""
+
+
+# ---------------------------------------------------------------------------
+#  spotapi-based parsers (NO API keys, NO login - public web API only)
+# ---------------------------------------------------------------------------
+
+def _parse_spotify_track_spotapi(spotify_id):
+    """Parse a single Spotify track using spotapi.Public.song_info()."""
+    if not SPOTAPI_AVAILABLE:
+        return None
+    try:
+        raw = SpotapiPublic.song_info(spotify_id)
+        t = (raw.get("data", {}) or {}).get("trackUnion", {}) or {}
+        if not t:
+            return None
+        artist = ""
+        fa_items = (t.get("firstArtist", {}) or {}).get("items", []) or []
+        if fa_items:
+            artist = (fa_items[0].get("profile", {}) or {}).get("name", "") or ""
+        album_obj = t.get("albumOfTrack", {}) or {}
+        cover = _best_spotify_image(album_obj.get("coverArt", {}).get("sources", []))
+        uri = t.get("uri", "") or ""
+        return {
+            "title": t.get("name", "Unknown Track") or "Unknown Track",
+            "artist": artist or "Unknown Artist",
+            "album": album_obj.get("name", "") or "",
+            "duration": _format_duration_ms((t.get("duration", {}) or {}).get("totalMilliseconds", 0)),
+            "thumb": cover,
+            "url": _uri_to_url(uri),
+            "uri": uri,
+        }
+    except Exception as e:
+        print(f"spotapi track parse failed: {e}")
+        return None
+
+
 def _parse_spotify_track_public(track_url):
-    """Parse a single Spotify track using oEmbed (no credentials needed)."""
+    """Parse a single Spotify track using oEmbed (fallback only)."""
     data = _spotify_oembed(track_url)
     if not data:
         return None
-    # oEmbed "title" is usually "Artist - Title"
     raw_title = data.get("title", "Unknown Track")
     artist = "Unknown Artist"
     title = raw_title
@@ -2776,118 +2821,143 @@ def _parse_spotify_track_public(track_url):
         "duration": 0,
         "thumb": data.get("thumbnail_url"),
         "url": track_url,
+        "uri": "",
     }
 
 
-def _parse_spotify_track_api(spotify_id):
-    """Parse a single Spotify track using the authenticated API."""
-    sp = get_spotify_client()
-    if not sp:
-        return None
-    try:
-        t = sp.track(spotify_id)
-        artists = t.get("artists", [])
-        artist = artists[0]["name"] if artists else "Unknown Artist"
-        album = (t.get("album") or {}).get("name")
-        images = (t.get("album") or {}).get("images", [])
-        thumb = images[0]["url"] if images else None
-        return {
-            "title": t.get("name", "Unknown Track"),
-            "artist": artist,
-            "album": album,
-            "duration": _format_duration_ms(t.get("duration_ms", 0)),
-            "thumb": thumb,
-            "url": t.get("external_urls", {}).get("spotify"),
-        }
-    except Exception as e:
-        print(f"Spotify track API failed: {e}")
-        return None
-
-
 def _parse_spotify_album(spotify_id):
-    """Parse a Spotify album into a list of tracks."""
-    sp = get_spotify_client()
+    """Parse a Spotify album into a list of tracks using spotapi (no credentials)."""
     tracks = []
     meta = {}
-    if sp:
-        try:
-            album = sp.album(spotify_id)
-            meta = {
-                "name": album.get("name"),
-                "artist": (album.get("artists") or [{}])[0].get("name", "Unknown Artist"),
-                "year": (album.get("release_date") or "")[:4],
-                "total": album.get("total_tracks", 0),
-                "thumb": (album.get("images") or [{}])[0].get("url"),
-            }
-            for t in album.get("tracks", {}).get("items", []):
-                artists = t.get("artists", [])
-                tracks.append({
-                    "title": t.get("name", "Unknown Track"),
-                    "artist": artists[0]["name"] if artists else meta["artist"],
-                    "album": meta["name"],
-                    "duration": _format_duration_ms(t.get("duration_ms", 0)),
-                    "thumb": meta["thumb"],
-                    "url": t.get("external_urls", {}).get("spotify"),
-                })
-            return tracks, meta
-        except Exception as e:
-            print(f"Spotify album API failed, will try public: {e}")
 
-    # Public fallback: only album-level info, no per-track list
-    album_url = f"https://open.spotify.com/album/{spotify_id}"
-    data = _spotify_oembed(album_url)
-    if data:
-        meta = {
-            "name": data.get("title", "Unknown Album"),
-            "artist": "Unknown Artist",
-            "year": "",
-            "total": 0,
-            "thumb": data.get("thumbnail_url"),
-        }
+    if SPOTAPI_AVAILABLE:
+        # --- 1. Album metadata via get_album_info() ---
+        try:
+            album = SpotapiPublicAlbum(spotify_id)
+            info = album.get_album_info(limit=1, offset=0) or {}
+            au = (info.get("data", {}) or {}).get("albumUnion", {}) or {}
+            art_items = (au.get("artists", {}) or {}).get("items", []) or []
+            artist_name = "Unknown Artist"
+            if art_items:
+                artist_name = (art_items[0].get("profile", {}) or {}).get("name", "") or "Unknown Artist"
+            meta = {
+                "name": au.get("name", "Unknown Album") or "Unknown Album",
+                "artist": artist_name,
+                "year": str((au.get("date") or {}).get("year", "") or ""),
+                "total": (au.get("tracksV2", {}) or {}).get("totalCount", 0) or 0,
+                "thumb": _best_spotify_image((au.get("coverArt", {}) or {}).get("sources", [])),
+            }
+        except Exception as e:
+            print(f"spotapi album meta failed: {e}")
+            meta = {"name": "Unknown Album", "artist": "Unknown Artist", "year": "", "total": 0, "thumb": None}
+
+        # --- 2. Full track list via paginate_album() ---
+        try:
+            for chunk in album.paginate_album():
+                if not isinstance(chunk, list):
+                    continue
+                for item in chunk:
+                    if not isinstance(item, dict):
+                        continue
+                    t = item.get("track", {}) or {}
+                    if not t:
+                        continue
+                    art_items = (t.get("artists", {}) or {}).get("items", []) or []
+                    a_name = (art_items[0].get("profile", {}) or {}).get("name", meta["artist"]) if art_items else meta["artist"]
+                    uri = t.get("uri", "") or ""
+                    tracks.append({
+                        "title": t.get("name", "Unknown Track") or "Unknown Track",
+                        "artist": a_name,
+                        "album": meta["name"],
+                        "duration": _format_duration_ms((t.get("duration", {}) or {}).get("totalMilliseconds", 0)),
+                        "thumb": meta["thumb"],
+                        "url": _uri_to_url(uri),
+                        "uri": uri,
+                    })
+        except Exception as e:
+            print(f"spotapi album tracks failed: {e}")
+
+    # --- Fallback: oEmbed (album-level info only, no track list) ---
+    if not tracks:
+        album_url = f"https://open.spotify.com/album/{spotify_id}"
+        data = _spotify_oembed(album_url)
+        if data:
+            meta = {
+                "name": data.get("title", "Unknown Album"),
+                "artist": "Unknown Artist",
+                "year": "",
+                "total": 0,
+                "thumb": data.get("thumbnail_url"),
+            }
     return tracks, meta
 
 
 def _parse_spotify_playlist(spotify_id):
-    """Parse a Spotify playlist into a list of tracks."""
-    sp = get_spotify_client()
+    """Parse a Spotify playlist into a list of tracks using spotapi (no credentials)."""
     tracks = []
     meta = {}
-    if sp:
-        try:
-            pl = sp.playlist(spotify_id)
-            meta = {
-                "name": pl.get("name", "Unknown Playlist"),
-                "owner": (pl.get("owner") or {}).get("display_name", "Unknown"),
-                "total": pl.get("tracks", {}).get("total", 0),
-                "thumb": (pl.get("images") or [{}])[0].get("url"),
-            }
-            for item in pl.get("tracks", {}).get("items", []):
-                t = item.get("track") or {}
-                if not t:
-                    continue
-                artists = t.get("artists", [])
-                tracks.append({
-                    "title": t.get("name", "Unknown Track"),
-                    "artist": artists[0]["name"] if artists else "Unknown Artist",
-                    "album": (t.get("album") or {}).get("name"),
-                    "duration": _format_duration_ms(t.get("duration_ms", 0)),
-                    "thumb": ((t.get("album") or {}).get("images") or [{}])[0].get("url"),
-                    "url": t.get("external_urls", {}).get("spotify"),
-                })
-            return tracks, meta
-        except Exception as e:
-            print(f"Spotify playlist API failed, will try public: {e}")
 
-    # Public fallback: playlist-level info only
-    pl_url = f"https://open.spotify.com/playlist/{spotify_id}"
-    data = _spotify_oembed(pl_url)
-    if data:
-        meta = {
-            "name": data.get("title", "Unknown Playlist"),
-            "owner": "Unknown",
-            "total": 0,
-            "thumb": data.get("thumbnail_url"),
-        }
+    if SPOTAPI_AVAILABLE:
+        # --- 1. Playlist metadata via get_playlist_info() ---
+        try:
+            pl = SpotapiPublicPlaylist(spotify_id)
+            info = pl.get_playlist_info(limit=1, offset=0) or {}
+            pu = (info.get("data", {}) or {}).get("playlistV2", {}) or {}
+            owner = (pu.get("ownerV2", {}) or {}).get("data", {}) or {}
+            meta = {
+                "name": pu.get("name", "Unknown Playlist") or "Unknown Playlist",
+                "owner": owner.get("name", "Unknown") or "Unknown",
+                "total": (pu.get("content", {}) or {}).get("totalCount", 0) or 0,
+                "thumb": None,
+            }
+            imgs = (pu.get("images", {}) or {}).get("items", []) or []
+            if imgs:
+                meta["thumb"] = _best_spotify_image((imgs[0].get("sources", []) or []))
+        except Exception as e:
+            print(f"spotapi playlist meta failed: {e}")
+            meta = {"name": "Unknown Playlist", "owner": "Unknown", "total": 0, "thumb": None}
+
+        # --- 2. Full track list via paginate_playlist() ---
+        try:
+            for chunk in pl.paginate_playlist():
+                items = (chunk.get("items", []) if isinstance(chunk, dict) else []) or []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    t = (item.get("itemV2", {}) or {}).get("data", {}) or {}
+                    if not t or t.get("__typename") != "Track":
+                        continue
+                    art_items = (t.get("artists", {}) or {}).get("items", []) or []
+                    a_name = (art_items[0].get("profile", {}) or {}).get("name", "Unknown Artist") if art_items else "Unknown Artist"
+                    album_obj = t.get("albumOfTrack", {}) or {}
+                    cover = _best_spotify_image((album_obj.get("coverArt", {}) or {}).get("sources", []))
+                    uri = t.get("uri", "") or ""
+                    # duration can be under 'trackDuration' or 'duration' depending on context
+                    dur_ms = ((t.get("trackDuration", {}) or {}).get("totalMilliseconds", 0)
+                              or (t.get("duration", {}) or {}).get("totalMilliseconds", 0))
+                    tracks.append({
+                        "title": t.get("name", "Unknown Track") or "Unknown Track",
+                        "artist": a_name,
+                        "album": album_obj.get("name", "") or "",
+                        "duration": _format_duration_ms(dur_ms),
+                        "thumb": cover,
+                        "url": _uri_to_url(uri),
+                        "uri": uri,
+                    })
+        except Exception as e:
+            print(f"spotapi playlist tracks failed: {e}")
+
+    # --- Fallback: oEmbed (playlist-level info only, no track list) ---
+    if not tracks:
+        pl_url = f"https://open.spotify.com/playlist/{spotify_id}"
+        data = _spotify_oembed(pl_url)
+        if data:
+            meta = {
+                "name": data.get("title", "Unknown Playlist"),
+                "owner": "Unknown",
+                "total": 0,
+                "thumb": data.get("thumbnail_url"),
+            }
     return tracks, meta
 
 
@@ -2896,14 +2966,17 @@ def parse_spotify_url(url):
     Parse any Spotify URL.
     Returns dict: {content_type, tracks: [...], meta: {...}}
     content_type is one of: track, album, playlist, artist, unknown
+
+    Uses spotapi (public, NO API keys, NO login) for full metadata + track
+    lists. Falls back to oEmbed if spotapi is unavailable.
     """
     content_type, spotify_id = detect_spotify_content_type(url)
     if not content_type:
         return {"content_type": "unknown", "tracks": [], "meta": {}}
 
     if content_type == "track":
-        # Try API first, then public oEmbed
-        t = _parse_spotify_track_api(spotify_id) or _parse_spotify_track_public(url)
+        # spotapi first (rich metadata), then oEmbed fallback
+        t = _parse_spotify_track_spotapi(spotify_id) or _parse_spotify_track_public(url)
         if t:
             return {"content_type": "track", "tracks": [t], "meta": {"track": t}}
         return {"content_type": "track", "tracks": [], "meta": {}}
@@ -2917,8 +2990,8 @@ def parse_spotify_url(url):
         return {"content_type": "playlist", "tracks": tracks, "meta": meta}
 
     if content_type == "artist":
-        # For artist links we can't reliably list top tracks without API,
-        # so just record metadata and let the UI inform the user.
+        # Artist pages don't expose a clean public track list; record metadata
+        # and let the UI inform the user.
         data = _spotify_oembed(url) or {}
         meta = {
             "name": data.get("title", "Unknown Artist"),
@@ -4850,11 +4923,11 @@ def setup_uptimerobot_keepalive():
 # ===== Main Entry Point =====
 if __name__ == '__main__':
     print("=" * 60)
-    print("  Enhanced Telegram Downloader Bot  v4.0")
+    print("  Enhanced Telegram Downloader Bot  v4.1")
     print("  Platforms: SoundCloud | Spotify | YouTube | Pinterest")
     print("             Instagram | TikTok | Twitter (X)")
     print(f"  Port: {PORT} | Cookies: {COOKIES_AVAILABLE}")
-    print(f"  Spotify: {'API mode' if (SPOTIPY_AVAILABLE and SPOTIFY_CLIENT_ID) else ('public mode' if not SPOTIPY_AVAILABLE else 'no credentials - public mode')}")
+    print(f"  Spotify: {'public mode (spotapi - no API keys needed)' if SPOTAPI_AVAILABLE else 'oEmbed fallback mode'}")
     print(f"  Bot username: @{BOT_USERNAME}")
     print("=" * 60)
     print(f"Local URL: http://localhost:{PORT}")
