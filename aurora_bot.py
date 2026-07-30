@@ -268,10 +268,7 @@ class ProgressBar:
             percentage = 0
             
         progress_bar = self.create_progress_bar(percentage)
-        done_str = human_size(done_bytes)
-        total_str = human_size(total_bytes)
-        
-        return f"{progress_bar} {percentage}% ({done_str}/{total_str})"
+        return f"{progress_bar} {percentage}%"
     
     def should_update(self, current_percentage):
         """Check if we should update the progress message"""
@@ -505,7 +502,7 @@ T = {
         "batch_cancel": "❌ لغو دانلود",
         "batch_cancelled": "⏹️ دانلود لغو شد\n📦 {done}/{total} ارسال شد{errors}",
         "batch_cancelled_short": "⏹️ لغو شد",
-        "batch_progress_cancelable": "📦 دانلود گروهی\n{bar} {pct}%\n✅ {done}/{total} ارسال شد\n🎵 در حال: {current}",
+        "batch_progress_cancelable": "📦 دانلود گروهی\n{bar} {pct}% [{done}/{total}]\n🎵 در حال: {current}",
         "batch_failed_list": "\n\n⚠️ ناموفق‌ها ({count}):\n{list}",
         "batch_failed_more": "\n... و {count} مورد دیگر",
     },
@@ -705,7 +702,7 @@ T = {
         "batch_cancel": "❌ Cancel download",
         "batch_cancelled": "⏹️ Download cancelled\n📦 {done}/{total} sent{errors}",
         "batch_cancelled_short": "⏹️ Cancelled",
-        "batch_progress_cancelable": "📦 Batch download\n{bar} {pct}%\n✅ {done}/{total} sent\n🎵 Now: {current}",
+        "batch_progress_cancelable": "📦 Batch download\n{bar} {pct}% [{done}/{total}]\n🎵 Now: {current}",
         "batch_failed_list": "\n\n⚠️ Failed ({count}):\n{list}",
         "batch_failed_more": "\n... and {count} more",
     },
@@ -3316,11 +3313,11 @@ class _SilentLogger:
 def download_spotify_track_audio(track_meta, workdir, progress_hook=None, chat_id=None):
     """Download a Spotify track's audio using spotdl.
 
-    Architecture (canonical spotDL pattern):
-      1. Create ONE spotdl Song object from the Spotify track URL.
-      2. Create ONE Downloader with the full audio_providers list.
-      3. Call search_and_download(song) → (song, path|None).
-      4. If path is None (all providers failed), fall back to raw yt-dlp search.
+    Strategy (handles SoundCloud DRM issue):
+      1. Song.from_url(track_url) → search_and_download with ALL providers
+      2. If path is None (e.g. SoundCloud DRM) → retry with youtube-music ONLY
+      3. If still None → Song.from_search_term(query) → search_and_download
+      4. If still None → give up
 
     Returns an item dict or None on failure.
     """
@@ -3333,7 +3330,6 @@ def download_spotify_track_audio(track_meta, workdir, progress_hook=None, chat_i
         print("[Spotify] no track id in metadata, cannot download")
         return None
 
-    # Determine the user's preferred bitrate
     bitrate = SPOTIFY_AUDIO_BITRATE
     if chat_id is not None:
         user_q = get_platform_quality(chat_id, "spotify")
@@ -3341,46 +3337,34 @@ def download_spotify_track_audio(track_meta, workdir, progress_hook=None, chat_i
             bitrate = user_q
     bitrate_k = f"{bitrate}k"
 
-    SIZE_GUARD = 45 * 1024 * 1024  # 45 MB re-encode threshold
+    SIZE_GUARD = 45 * 1024 * 1024
     track_url = f"https://open.spotify.com/track/{track_id}"
     query_label = f"{track_meta.get('artist','?')} - {track_meta.get('title','?')}"
 
-    # === Step 1: Build the Song object ONCE ===
-    try:
-        from spotdl.types.song import Song as _SpotdlSong
-        song = _SpotdlSong.from_url(track_url)
-        print(f"[Spotify] spotdl metadata: {song.artist} - {song.name} ({song.duration}s)")
-    except Exception as e:
-        print(f"[Spotify] Song.from_url failed for '{query_label}': {type(e).__name__}: {e}")
-        song = None
-
-    # === Step 2: One Downloader with the full provider list ===
-    if song is not None:
+    def _try_spotdl(song_obj, providers, label=""):
+        """Try to download a song with given providers. Returns item dict or None."""
         try:
             from spotdl.download.downloader import Downloader as _SpotdlDownloader
             from spotdl.types.options import DownloaderOptions as _SpotdlOpts
 
             settings = {
-                "format": "mp3",
-                "bitrate": bitrate_k,
+                "format": "mp3", "bitrate": bitrate_k,
                 "output": os.path.join(workdir, "{artists} - {title}.{output-ext}"),
                 "cookie_file": COOKIES_PATH if COOKIES_AVAILABLE else None,
-                "ffmpeg": "ffmpeg",
-                "log_level": "ERROR",
-                "simple_tui": True,
-                "audio_providers": SPOTDL_AUDIO_PROVIDERS,
+                "ffmpeg": "ffmpeg", "log_level": "ERROR", "simple_tui": True,
+                "audio_providers": providers,
                 "yt_dlp_args": "--retries 1 --fragment-retries 1 --extractor-retries 1 --socket-timeout 20",
             }
             opts = _SpotdlOpts(settings)
             dl = _SpotdlDownloader(opts)
 
-            print(f"[Spotify] spotdl downloading (providers={SPOTDL_AUDIO_PROVIDERS}): {query_label}")
-            result_song, path = dl.search_and_download(song)
+            print(f"[Spotify] spotdl{label} (providers={providers}): {query_label}")
+            result_song, path = dl.search_and_download(song_obj)
 
             if path and os.path.exists(str(path)):
                 fp = str(path)
                 file_size = os.path.getsize(fp)
-                print(f"[Spotify] spotdl OK: {human_size(file_size)}")
+                print(f"[Spotify] spotdl OK{label}: {human_size(file_size)}")
 
                 # Size guard
                 if file_size > SIZE_GUARD:
@@ -3390,17 +3374,15 @@ def download_spotify_track_audio(track_meta, workdir, progress_hook=None, chat_i
                     elif bitrate == "128": chain = ["96"]
                     else: chain = ["96"]
                     for lower_br in chain:
-                        print(f"[Spotify] file too large ({human_size(file_size)}), re-encoding at {lower_br}k")
                         if _sp_reencode_mp3(fp, bitrate=lower_br):
                             file_size = os.path.getsize(fp)
-                            print(f"[Spotify] re-encoded to {human_size(file_size)} @ {lower_br}k")
                             if file_size <= SIZE_GUARD:
                                 break
 
-                # Re-tag with our spotapi metadata
+                # Re-tag with spotapi metadata
                 _sp_tag_mp3(fp, track_meta, cover_url=track_meta.get("cover"))
 
-                # rename to "artist - title.mp3"
+                # Rename
                 safe_artist = sanitize_name(track_meta.get("artist") or "Unknown")
                 safe_title = sanitize_name(track_meta.get("title") or "Unknown")
                 new_fp = os.path.join(workdir, f"{safe_artist} - {safe_title}.mp3")
@@ -3429,78 +3411,51 @@ def download_spotify_track_audio(track_meta, workdir, progress_hook=None, chat_i
                     "cover": track_meta.get("cover"),
                 }
             else:
-                print(f"[Spotify] spotdl returned no path for '{query_label}'")
+                print(f"[Spotify] spotdl{label} returned no path for '{query_label}'")
+                return None
         except Exception as e:
-            print(f"[Spotify] spotdl Downloader failed for '{query_label}': {type(e).__name__}: {str(e)[:150]}")
+            print(f"[Spotify] spotdl{label} failed for '{query_label}': {type(e).__name__}: {str(e)[:150]}")
+            return None
 
-    # === Step 3: Last-resort fallback — spotdl search by term ===
-    # If Song.from_url failed, try searching by "artist - title"
-    if song is None:
-        try:
-            from spotdl.types.song import Song as _SpotdlSong
-            from spotdl.download.downloader import Downloader as _SpotdlDownloader
-            from spotdl.types.options import DownloaderOptions as _SpotdlOpts
+    # === Step 1: Song.from_url + all providers ===
+    try:
+        from spotdl.types.song import Song as _SpotdlSong
+        song = _SpotdlSong.from_url(track_url)
+        print(f"[Spotify] spotdl metadata: {song.artist} - {song.name} ({song.duration}s)")
+    except Exception as e:
+        print(f"[Spotify] Song.from_url failed: {type(e).__name__}: {e}")
+        song = None
 
-            query = f"{track_meta.get('artist','')} - {track_meta.get('title','')}".strip(" -")
-            print(f"[Spotify] last-resort spotdl search: {query}")
-            song = _SpotdlSong.from_search_term(query)
+    if song is not None:
+        # Step 1a: try all providers
+        result = _try_spotdl(song, SPOTDL_AUDIO_PROVIDERS, "")
+        if result:
+            return result
 
-            settings = {
-                "format": "mp3", "bitrate": bitrate_k,
-                "output": os.path.join(workdir, "{artists} - {title}.{output-ext}"),
-                "cookie_file": COOKIES_PATH if COOKIES_AVAILABLE else None,
-                "ffmpeg": "ffmpeg", "log_level": "ERROR", "simple_tui": True,
-                "audio_providers": SPOTDL_AUDIO_PROVIDERS,
-                "yt_dlp_args": "--retries 1 --fragment-retries 1 --extractor-retries 1 --socket-timeout 20",
-            }
-            opts = _SpotdlOpts(settings)
-            dl = _SpotdlDownloader(opts)
-            result_song, path = dl.search_and_download(song)
+        # Step 1b: all providers failed (likely SoundCloud DRM) → retry youtube-music only
+        print(f"[Spotify] retrying with youtube-music only (SoundCloud DRM?)")
+        result = _try_spotdl(song, ["youtube-music"], " (yt-music retry)")
+        if result:
+            return result
 
-            if path and os.path.exists(str(path)):
-                fp = str(path)
-                file_size = os.path.getsize(fp)
-                print(f"[Spotify] last-resort OK: {human_size(file_size)}")
+    # === Step 2: Song.from_search_term + all providers ===
+    try:
+        from spotdl.types.song import Song as _SpotdlSong
+        query = f"{track_meta.get('artist','')} - {track_meta.get('title','')}".strip(" -")
+        print(f"[Spotify] fallback search: {query}")
+        song2 = _SpotdlSong.from_search_term(query)
+        result = _try_spotdl(song2, SPOTDL_AUDIO_PROVIDERS, " (search fallback)")
+        if result:
+            return result
 
-                if file_size > SIZE_GUARD:
-                    for lower_br in ["192", "128", "96"]:
-                        if _sp_reencode_mp3(fp, bitrate=lower_br):
-                            file_size = os.path.getsize(fp)
-                            if file_size <= SIZE_GUARD:
-                                break
+        # Step 2b: try youtube-music only
+        result = _try_spotdl(song2, ["youtube-music"], " (search yt-music)")
+        if result:
+            return result
+    except Exception as e:
+        print(f"[Spotify] fallback search failed: {type(e).__name__}: {str(e)[:150]}")
 
-                _sp_tag_mp3(fp, track_meta, cover_url=track_meta.get("cover"))
-                safe_artist = sanitize_name(track_meta.get("artist") or "Unknown")
-                safe_title = sanitize_name(track_meta.get("title") or "Unknown")
-                new_fp = os.path.join(workdir, f"{safe_artist} - {safe_title}.mp3")
-                try:
-                    if os.path.abspath(fp) != os.path.abspath(new_fp):
-                        if os.path.exists(new_fp):
-                            os.remove(new_fp)
-                        os.rename(fp, new_fp)
-                    fp = new_fp
-                except Exception:
-                    pass
-
-                thumb_file = ""
-                if track_meta.get("cover"):
-                    thumb_file = file_processor.download_thumb(track_meta["cover"], workdir)
-
-                return {
-                    "filepath": fp,
-                    "title": track_meta.get("title") or "Unknown",
-                    "artist": track_meta.get("artist") or "Unknown",
-                    "album": track_meta.get("album"),
-                    "size": os.path.getsize(fp),
-                    "duration": track_meta.get("duration") or 0,
-                    "thumb_file": thumb_file,
-                    "ext": "mp3",
-                    "cover": track_meta.get("cover"),
-                }
-        except Exception as e:
-            print(f"[Spotify] last-resort spotdl search failed: {type(e).__name__}: {str(e)[:150]}")
-
-    print(f"[Spotify] all methods failed for '{query_label}'")
+    print(f"[Spotify] ALL methods failed for '{query_label}'")
     return None
 
 # ===== Enhanced Pinterest Downloader =====
